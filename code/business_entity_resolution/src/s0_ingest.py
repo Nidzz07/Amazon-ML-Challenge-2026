@@ -2,7 +2,8 @@
 
 Usage:
     python s0_ingest.py            # full dataset, asserts exact row counts
-    python s0_ingest.py --smoke    # data/smoke/, no row-count assertion
+    python s0_ingest.py --smoke    # artifacts/smoke/smoke_*.tsv -> artifacts/smoke/, no row-count assertion
+    python s0_ingest.py --smoke --input DIR --output DIR   # override raw-TSV and parquet dirs
 """
 import argparse
 import sys
@@ -88,11 +89,11 @@ def print_summary(results: list[dict]) -> None:
         print(f"{r['split']:<6} {r['src']:<13} {r['rows']:>11,} {exp:>11} {ok:>3} {ea:>10} {sg:>10} {r['mb']:>7.1f} {r['sec']:>6.1f}")
 
 
-def run(dataset_dir: Path, artifacts_dir: Path, check_counts: bool) -> list[dict]:
+def run(dataset_dir: Path, artifacts_dir: Path, check_counts: bool, raw_path_fn=config.raw_path) -> list[dict]:
     results = []
     for split, srcs in config.SPLITS.items():
         for src in srcs:
-            raw = config.raw_path(split, src, dataset_dir)
+            raw = raw_path_fn(split, src, dataset_dir)
             out = config.records_path(split, src, artifacts_dir)
             expected = config.EXPECTED_ROWS[(split, src)] if check_counts else None
             print(f"ingesting {raw.name} ...", flush=True)
@@ -102,15 +103,18 @@ def run(dataset_dir: Path, artifacts_dir: Path, check_counts: bool) -> list[dict
 
 def main(argv=None) -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--smoke", action="store_true", help="read data/smoke/ instead of data/dataset/")
+    ap.add_argument("--smoke", action="store_true", help="read artifacts/smoke/smoke_*.tsv instead of data/dataset/")
+    ap.add_argument("--input", type=Path, help="override the raw-TSV directory")
+    ap.add_argument("--output", type=Path, help="override the parquet output directory")
     args = ap.parse_args(argv)
-    dataset_dir = config.SMOKE_DIR if args.smoke else config.DATASET_DIR
-    artifacts_dir = config.SMOKE_ARTIFACTS_DIR if args.smoke else config.ARTIFACTS_DIR
+    dataset_dir = args.input or (config.SMOKE_DIR if args.smoke else config.DATASET_DIR)
+    artifacts_dir = args.output or (config.SMOKE_ARTIFACTS_DIR if args.smoke else config.ARTIFACTS_DIR)
+    raw_path_fn = config.smoke_raw_path if args.smoke else config.raw_path
     t0 = time.perf_counter()
-    results = run(dataset_dir, artifacts_dir, check_counts=not args.smoke)
+    results = run(dataset_dir, artifacts_dir, check_counts=not args.smoke, raw_path_fn=raw_path_fn)
     print()
     print_summary(results)
-    print(f"\ntotal {time.perf_counter() - t0:.1f}s -> {config.ARTIFACTS_DIR}")
+    print(f"\ntotal {time.perf_counter() - t0:.1f}s -> {artifacts_dir}")
 
 
 if __name__ == "__main__":

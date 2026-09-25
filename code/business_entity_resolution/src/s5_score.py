@@ -1,0 +1,52 @@
+"""S5 Score (STUB, owner: Tanuj): model + features_{split} -> scored_{split}.
+
+Placeholder. It refuses to run if model.txt's feature_version differs from the
+current FEATURE_VERSION; keep that guard in the real version. The stub
+"probability" is the blocking prior_score (feature f000) clipped to [0, 1].
+
+Output: source1_entity_id str, candidate_entity_id str, prob float32.
+
+Usage:
+    python s5_score.py [--smoke] [--input DIR] [--output DIR]
+"""
+import json
+import sys
+import time
+
+import polars as pl
+
+import config
+import pipeline_io as pio
+
+
+def load_model(in_dir) -> dict:
+    model = json.loads(config.model_path(in_dir).read_text(encoding=config.ENCODING))
+    names, version = pio.feature_spec()
+    if model["feature_version"] != version or model["feature_names"] != list(names):
+        raise SystemExit(
+            f"model.txt was trained on FEATURE_VERSION {model['feature_version']}, "
+            f"current is {version}: retrain before scoring"
+        )
+    return model
+
+
+def main(argv=None) -> None:
+    args = pio.parser(__doc__).parse_args(argv)
+    in_dir, out_dir = pio.dirs(args)
+    t0 = time.perf_counter()
+    load_model(in_dir)
+    for split in config.SPLITS:
+        scored = (
+            pl.scan_parquet(config.features_path(split, in_dir))
+            .select("source1_entity_id", "candidate_entity_id", pl.col("f000").clip(0.0, 1.0).cast(pl.Float32).alias("prob"))
+            .collect()
+        )
+        pio.check_schema(scored, pio.SCORED_SCHEMA, f"scored_{split}")
+        out = config.scored_path(split, out_dir)
+        scored.write_parquet(out)
+        print(f"{out.name:<22} {scored.height:>10,} pairs")
+    print(f"s5 done in {time.perf_counter() - t0:.1f}s")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

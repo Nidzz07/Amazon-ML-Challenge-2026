@@ -32,7 +32,7 @@ def write_fixture(root):
         p.write_text(text, encoding="utf-8", newline="\n")
 
 
-def check_outputs(artifacts_dir, dataset_dir):
+def check_outputs(artifacts_dir, dataset_dir, raw_path_fn=config.raw_path):
     for split, srcs in config.SPLITS.items():
         for src in srcs:
             df = pl.read_parquet(config.records_path(split, src, artifacts_dir))
@@ -40,7 +40,7 @@ def check_outputs(artifacts_dir, dataset_dir):
             assert tuple(df.columns) == want
             assert all(dt == pl.String for dt in df.dtypes)
             assert df.null_count().sum_horizontal().item() == 0
-            raw_rows = sum(1 for _ in open(config.raw_path(split, src, dataset_dir), encoding="utf-8")) - 1
+            raw_rows = sum(1 for _ in open(raw_path_fn(split, src, dataset_dir), encoding="utf-8")) - 1
             assert df.height == raw_rows
 
 
@@ -77,7 +77,27 @@ def test_ingest_rejects_bad_header(tmp_path):
         s0_ingest.ingest_file("train", "source1", raw, tmp_path / "out.parquet")
 
 
-@pytest.mark.skipif(not config.SMOKE_DIR.exists(), reason="data/smoke/ not created yet")
+SMOKE_READY = all(config.smoke_raw_path(sp, src).exists() for sp, srcs in config.SPLITS.items() for src in srcs)
+
+
+@pytest.mark.skipif(not SMOKE_READY, reason="smoke TSVs missing - run make_smoke_sample.py")
 def test_ingest_smoke(tmp_path):
-    s0_ingest.run(config.SMOKE_DIR, tmp_path, check_counts=False)
-    check_outputs(tmp_path, config.SMOKE_DIR)
+    s0_ingest.run(config.SMOKE_DIR, tmp_path, check_counts=False, raw_path_fn=config.smoke_raw_path)
+    check_outputs(tmp_path, config.SMOKE_DIR, raw_path_fn=config.smoke_raw_path)
+
+    s1 = pl.read_parquet(config.records_path("train", "source1", tmp_path))
+    gt = pl.read_parquet(config.records_path("train", "ground_truth", tmp_path))
+    assert s1.height == gt.height == config.SMOKE_TRAIN_ENTITIES
+    assert set(s1["entity_id"]) == set(gt["source1_entity_id"])
+
+    # Every true match of a sampled entity must be present in the smoke S2/S3 pool.
+    pool = pl.concat([pl.read_parquet(config.records_path("train", s, tmp_path))["entity_id"] for s in ("source2", "source3")])
+    matched = gt["matched_entity_ids"].str.split(",").explode(empty_as_null=False)
+    matched = matched.filter(matched != "")
+    assert matched.is_in(pool.implode()).all()
+
+    test_s1 = pl.read_parquet(config.records_path("test", "source1", tmp_path))
+    assert test_s1.height == config.SMOKE_TEST_ENTITIES
+    by_country = dict(test_s1.group_by("country").len().iter_rows())
+    assert set(by_country) == {"US", "India", "France"}
+    assert by_country["France"] >= config.SMOKE_TEST_MIN_PER_COUNTRY
