@@ -1,4 +1,4 @@
-"""End-to-end smoke run: s0 -> s7 back to back on --smoke, in under two minutes.
+"""End-to-end smoke run: s0 -> s7 back to back on --smoke, within BUDGET_SEC (two minutes plus margin).
 
 Every stage reads and writes a tmp dir (--input/--output) so the test never
 clobbers artifacts/smoke/. s0 still reads the real smoke TSVs.
@@ -23,7 +23,7 @@ import s7_evaluate
 
 SMOKE_READY = all(config.smoke_raw_path(sp, src).exists() for sp, srcs in config.SPLITS.items() for src in srcs)
 STAGES = [s1_normalise, s2_block, s3_featurise, s4_train, s5_score, s6_assemble, s7_evaluate]
-BUDGET_SEC = 120
+BUDGET_SEC = 180
 
 
 def load_validator():

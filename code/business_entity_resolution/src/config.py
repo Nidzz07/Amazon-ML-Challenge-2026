@@ -1,4 +1,5 @@
 """All paths and global knobs. No other module may contain a literal path."""
+import os
 from pathlib import Path
 
 SEED = 42
@@ -110,7 +111,9 @@ VAL_ENTITY_IDS = ARTIFACTS_DIR / "val_entity_ids.parquet"
 
 # Smoke sample.
 SMOKE_TRAIN_ENTITIES = 50_000
-SMOKE_DISTRACTOR_RATIO = 10  # distractor S2/S3 records per true-match record
+# Distractor S2/S3 records per true-match record. 0.35 reproduces full-scale pool
+# density: (1 + 0.35) x 3.46 true matches ~= 4.68 pool records per Source-1 entity.
+SMOKE_DISTRACTOR_RATIO = 0.35
 SMOKE_TEST_ENTITIES = 5_000
 SMOKE_TEST_MIN_PER_COUNTRY = 500  # every test country (France included) gets at least this many S1 rows
 
@@ -120,6 +123,34 @@ CHANNELS = ("name_tfidf", "addr_tfidf", "exact_key", "rare_token", "embed_ann")
 MAX_CANDIDATES_PER_ENTITY = 60
 EXACT_KEY_MAX_BUCKET = 500
 
-# Placeholder decision threshold used only by the S6 stub until the
-# expected-F0.5 prefix search replaces it.
-STUB_MATCH_THRESHOLD = 0.5
+# Assembly (S6). How the empty prediction (m = 0) is scored in the expected-F0.5
+# prefix search; m >= 1 always uses the plug-in 1.25*c_hat / (0.25*k_hat + m).
+#   "p_none": P(k = 0) = prod(1 - q_i) over the entity's candidates, i.e. the chance
+#             an empty list scores 1.0 (roadmap, scoreboard point 2).
+#   "plugin": the plug-in formula at m = 0, which is 0 whenever k_hat > 0 (and 1
+#             when k_hat = 0), so empty wins only if every q_i is 0.
+ASSEMBLY_EMPTY_SCORE = "p_none"
+
+# Blocking channels (src/blocking/). All channels run per country shard.
+BLOCKING_THREADS = max(1, (os.cpu_count() or 2) - 1)
+TFIDF_BACKEND = "sparse_topn"  # exact sparse cosine; an "svd_faiss" backend can slot in behind the same interface
+TFIDF_NGRAM_RANGE = (3, 4)
+TFIDF_MIN_DF = 2
+# Drop n-grams in more than this many pool records before the top-k multiply.
+# The walk over common n-grams dominates query cost (the most frequent covers ~20% of
+# a shard); None = exact cosine.
+TFIDF_MAX_DF = 20_000
+TFIDF_TOP_K = 20
+TFIDF_CHUNK_ROWS = 20_000
+EXACT_KEY_FAMILIES = (("street_num", "city_norm"), ("postcode", "street_num"), ("name_acronym", "city_norm"))
+RARE_TOKEN_DF_MIN = 2
+RARE_TOKEN_DF_MAX = 5_000
+RARE_TOKENS_PER_ENTITY = 3
+RARE_TOKEN_CHUNK_ROWS = 50_000
+# Per-entity cap on this channel's own output (ranked by shared rare tokens, then rarity).
+# Uncapped, three tokens at df<=5000 can yield ~15k postings per entity.
+RARE_TOKEN_TOP_K = 100
+# Precomputed embedding ANN pairs (Tanuj, Gate 3). None until the path is fixed;
+# embed_ann returns zero candidates while it is None or missing.
+EMBED_ANN_PATH = None
+EMBED_TOP_K = 20

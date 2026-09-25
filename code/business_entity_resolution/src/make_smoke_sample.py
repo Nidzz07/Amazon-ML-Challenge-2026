@@ -72,7 +72,7 @@ def make_train(rng: np.random.Generator) -> dict[str, pl.DataFrame]:
     pools = {src: read("train", src) for src in config.CANDIDATE_SRCS}
     all_pool = pl.concat([p["entity_id"] for p in pools.values()])
     non_matching = all_pool.filter(~all_pool.is_in(true_ids.implode()))
-    distractors = sample_ids(non_matching, config.SMOKE_DISTRACTOR_RATIO * len(true_ids), rng)
+    distractors = sample_ids(non_matching, round(config.SMOKE_DISTRACTOR_RATIO * len(true_ids)), rng)
     keep = pl.concat([true_ids, distractors]).implode()
 
     out = {
@@ -85,7 +85,7 @@ def make_train(rng: np.random.Generator) -> dict[str, pl.DataFrame]:
     n_pool = out["source2"].height + out["source3"].height
     assert n_pool == len(true_ids) + len(distractors), "true-match ids missing from S2/S3"
     print(f"train: {len(s1_ids):,} entities, {len(true_ids):,} true-match records, "
-          f"{len(distractors):,} distractors ({len(distractors) / max(len(true_ids), 1):.1f}x)")
+          f"{len(distractors):,} distractors ({len(distractors) / max(len(true_ids), 1):.2f}x)")
     return out
 
 
