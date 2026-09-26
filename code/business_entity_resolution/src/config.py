@@ -154,7 +154,14 @@ TFIDF_MIN_DF = 2
 # smoke India pool but 71% of each query's name n-grams on the 4.13M full India pool.
 # Drop n-grams in more than this share of the (non-empty) pool records before the top-k
 # multiply. The walk over common n-grams dominates query cost; None = exact cosine.
-TFIDF_MAX_DF = 0.20
+# 0.20 was infeasible at full scale (addr_tfidf ~22 min per 20k queries); 0.01 is ~41k
+# on the full India pool. Records left with no n-gram are rescued by the fallback below.
+TFIDF_MAX_DF = 0.01
+# A record (query or pool) whose every n-gram is above TFIDF_MAX_DF would get an empty
+# vector and zero candidates. Such records alone keep their N lowest-df n-grams (df >=
+# TFIDF_MIN_DF, ties by hash) regardless of the ceiling; every other vector is unchanged.
+# 0 disables the fallback.
+TFIDF_EMPTY_FALLBACK_NGRAMS = 5
 TFIDF_TOP_K = 20
 TFIDF_CHUNK_ROWS = 20_000
 # city_norm / state_canon are filled by normalise.parse_address_components. street_num
@@ -168,7 +175,7 @@ EXACT_KEY_FAMILIES = (
 )
 RARE_TOKEN_DF_MIN = 2
 # Share of the shard's S1 + pool records (see the df ceilings note above TFIDF_MAX_DF).
-RARE_TOKEN_DF_MAX = 0.04
+RARE_TOKEN_DF_MAX = 0.005
 RARE_TOKENS_PER_ENTITY = 3
 RARE_TOKEN_CHUNK_ROWS = 50_000
 # Per-entity cap on this channel's own output (ranked by shared rare tokens, then rarity).

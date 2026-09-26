@@ -281,6 +281,8 @@ def main(argv=None) -> None:
         "knob_overrides": sorted(KNOBS[f] for f in given),
         # ceiling each channel resolved on each shard: {country: {knob[col]: {value, n_docs, resolved}}}
         "resolved": {c: {k: v for s in stats if s["country"] == c for k, v in s["resolved"].items()} for c in countries},
+        # per-shard channel counters, e.g. TF-IDF empty-vector fallbacks: {country: {key: {...}}}
+        "notes": {c: {k: v for s in stats if s["country"] == c for k, v in s["notes"].items()} for c in countries},
         "channel_sec": [{k: s[k] for k in ("country", "channel", "pairs", "entities", "sec")} for s in stats],
         "block_sec": t_block,
         "peak_rss_gb_block": gb(rss_block),
@@ -330,6 +332,9 @@ def main(argv=None) -> None:
     print("\nresolved df ceilings:")
     for c, res in report["resolved"].items():
         print(f"  {c}: " + ", ".join(f"{k} {v['value']!r} x {v['n_docs']:,} -> {v['resolved']!r}" for k, v in res.items()))
+    for c, notes in report["notes"].items():
+        for k, v in notes.items():
+            print(f"  {c}: {k} " + ", ".join(f"{a} {b:,}" for a, b in v.items()))
     fmt_gb = lambda v: "n/a" if v is None else f"{v:.2f} GB"  # noqa: E731
     print(f"knobs {knobs}")
     print(f"wall {report['wall_sec']:.1f}s (blocking {t_block:.1f}s), peak RSS {fmt_gb(report['peak_rss_gb'])} "

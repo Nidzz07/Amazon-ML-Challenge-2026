@@ -54,6 +54,22 @@ def pop_resolved() -> dict[str, dict]:
     return out
 
 
+# Other per shard x channel counters (e.g. TF-IDF empty-vector fallbacks), same lifecycle
+# as _resolved: s2_block pops them into its stats. Logging only.
+_notes: dict[str, dict] = {}
+
+
+def note(key: str, info: dict) -> None:
+    _notes[key] = info
+    print(f"    {key}: " + ", ".join(f"{k} {v:,}" if isinstance(v, int) else f"{k} {v}" for k, v in info.items()))
+
+
+def pop_notes() -> dict[str, dict]:
+    out = dict(_notes)
+    _notes.clear()
+    return out
+
+
 def rank_within_entity(pairs: pl.DataFrame, by: list[str], descending: list[bool], score: str) -> pl.DataFrame:
     """Assign channel_rank 1..n per entity by `by`, ties broken by candidate id."""
     return (
