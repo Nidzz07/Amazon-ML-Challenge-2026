@@ -10,6 +10,7 @@ import argparse
 import sys
 import time
 import gc
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import os
 
@@ -45,6 +46,31 @@ def _get_texts(records_lf: pl.LazyFrame, norm_lf: pl.LazyFrame) -> pl.DataFrame:
         pl.format("query: {} {}", clean("business_address"), clean("addr_roman")).alias("addr_text")
     ])
     return df
+
+class MultiGPUEncoder:
+    """One fp16 model replica per visible GPU; encode() splits the texts evenly and runs the halves concurrently."""
+
+    def __init__(self, name: str):
+        n = torch.cuda.device_count()
+        devices = [f"cuda:{i}" for i in range(n)] or ["cpu"]
+        self.models = []
+        for d in devices:
+            m = SentenceTransformer(name, device=d)
+            m.max_seq_length = MAX_SEQ_LEN
+            if d != "cpu":
+                m.half()
+            self.models.append(m)
+        print(f"Loaded {name} on {devices}", flush=True)
+
+    def encode(self, texts, **kw):
+        if len(self.models) == 1:
+            return self.models[0].encode(texts, **kw)
+        step = -(-len(texts) // len(self.models))
+        parts = [texts[i * step:(i + 1) * step] for i in range(len(self.models))]
+        with ThreadPoolExecutor(len(self.models)) as ex:
+            outs = list(ex.map(lambda mp: mp[0].encode(mp[1], **kw), zip(self.models, parts)))
+        return np.concatenate(outs)
+
 
 def embed_texts(model, texts: list[str], checkpoint_prefix: str) -> np.ndarray:
     """L2-normalised fp16 embeddings, resumable in CHUNK-sized .npy files; preallocated so peak RAM = result size."""
@@ -152,12 +178,7 @@ def main(argv=None) -> None:
     args = ap.parse_args(argv)
     in_dir, out_dir = pio.dirs(args)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Loading {MODEL_NAME} on {device}...")
-    model = SentenceTransformer(MODEL_NAME, device=device)
-    model.max_seq_length = MAX_SEQ_LEN
-    if device == "cuda":
-        model.half()
+    model = MultiGPUEncoder(MODEL_NAME)  # search runs on cuda:0, embedding is split across all GPUs
 
     out_path = config.EMBED_ANN_PATH
     if out_path is None or args.smoke:
