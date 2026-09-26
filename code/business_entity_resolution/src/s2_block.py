@@ -25,7 +25,7 @@ import polars as pl
 
 import config
 import pipeline_io as pio
-from blocking.common import CHANNEL_SCHEMA
+from blocking.common import CHANNEL_SCHEMA, pop_resolved
 
 CHANNEL_MODULES = {name: importlib.import_module(f"blocking.{name}") for name in config.CHANNELS}
 assert all(m.NAME == n for n, m in CHANNEL_MODULES.items())
@@ -44,11 +44,13 @@ def load_shard(split: str, in_dir, country: str, s1_ids: pl.Series | None = None
 
 
 def channel_pairs(split: str, in_dir, verbose: bool = True, s1_ids: pl.Series | None = None,
-                  countries: list[str] | None = None) -> tuple[pl.DataFrame, list[dict]]:
+                  countries: list[str] | None = None, smoke: bool = False) -> tuple[pl.DataFrame, list[dict]]:
     """Long (source1_entity_id, candidate_entity_id, channel_rank, channel_score, bit)
-    from every channel on every shard, plus per shard x channel stats. `s1_ids`
-    restricts the Source-1 side (the pool is always complete); `countries` restricts
-    which shards run (shards are independent, so per-country runs combine exactly)."""
+    from every channel on every shard, plus per shard x channel stats (including the
+    document-frequency ceilings each channel resolved). `s1_ids` restricts the
+    Source-1 side (the pool is always complete); `countries` restricts which shards run
+    (shards are independent, so per-country runs combine exactly); `smoke` is passed to
+    every channel (embed_ann uses it to pick its pairs file)."""
     if countries is None:
         countries = (
             pl.scan_parquet(config.norm_path(split, config.SOURCE1_SRC, in_dir))
@@ -62,14 +64,15 @@ def channel_pairs(split: str, in_dir, verbose: bool = True, s1_ids: pl.Series | 
         if verbose:
             print(f"[{split}/{country}] {s1.height:,} source1 x {pool.height:,} pool")
         for bit, (name, module) in enumerate(CHANNEL_MODULES.items()):
+            pop_resolved()
             t0 = time.perf_counter()
-            out = module.run(s1, pool)
+            out = module.run(s1, pool, smoke=smoke)
             sec = time.perf_counter() - t0
             pio.check_schema(out, CHANNEL_SCHEMA, f"{name} output")
             assert out.select(pl.struct("source1_entity_id", "candidate_entity_id").is_unique().all()).item(), name
             row = {
                 "split": split, "country": country, "channel": name, "pairs": out.height,
-                "entities": out["source1_entity_id"].n_unique(), "sec": sec,
+                "entities": out["source1_entity_id"].n_unique(), "sec": sec, "resolved": pop_resolved(),
             }
             stats.append(row)
             if verbose:
@@ -100,9 +103,9 @@ def cap(cands: pl.DataFrame, n: int = config.MAX_CANDIDATES_PER_ENTITY) -> pl.Da
     )
 
 
-def block(split: str, in_dir, verbose: bool = True) -> tuple[pl.DataFrame, pl.DataFrame, list[dict]]:
+def block(split: str, in_dir, verbose: bool = True, smoke: bool = False) -> tuple[pl.DataFrame, pl.DataFrame, list[dict]]:
     """(capped candidates, uncapped union, stats)."""
-    long, stats = channel_pairs(split, in_dir, verbose)
+    long, stats = channel_pairs(split, in_dir, verbose, smoke=smoke)
     uncapped = union(long)
     return cap(uncapped), uncapped, stats
 
@@ -115,7 +118,7 @@ def main(argv=None) -> None:
         if not config.norm_path(split, config.SOURCE1_SRC, in_dir).exists():
             print(f"  skipping {split} (norm_{split}_source1.parquet not found)")
             continue
-        cands, uncapped, _ = block(split, in_dir)
+        cands, uncapped, _ = block(split, in_dir, smoke=args.smoke)
         pio.check_schema(cands, pio.CANDIDATES_SCHEMA, f"candidates_{split}")
         out = config.candidates_path(split, out_dir)
         cands.write_parquet(out)

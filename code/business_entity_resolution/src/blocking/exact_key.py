@@ -39,7 +39,7 @@ def family_pairs(s1: pl.DataFrame, pool: pl.DataFrame, cols: tuple[str, ...]) ->
     )
 
 
-def run(s1: pl.DataFrame, pool: pl.DataFrame, families=config.EXACT_KEY_FAMILIES) -> pl.DataFrame:
+def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False, families=config.EXACT_KEY_FAMILIES) -> pl.DataFrame:
     """`families` defaults to config; the cap sweep passes a subset to ablate one family."""
     parts = [family_pairs(s1, pool, cols) for cols in families]
     pairs = pl.concat(parts)

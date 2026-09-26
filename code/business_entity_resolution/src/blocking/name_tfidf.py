@@ -7,5 +7,5 @@ from blocking.tfidf_index import tfidf_channel
 NAME = "name_tfidf"
 
 
-def run(s1: pl.DataFrame, pool: pl.DataFrame) -> pl.DataFrame:
+def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFrame:
     return tfidf_channel(s1, pool, "name_roman", config.TFIDF_TOP_K)

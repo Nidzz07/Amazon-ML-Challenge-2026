@@ -15,6 +15,9 @@ hash, which is stable for the pinned polars version, so the vocabulary never
 materialises strings. Weights are sublinear TF x smoothed IDF (sklearn's formula),
 L2-normalised per record, with the IDF fitted on the pool. Retrieval recall matches
 sklearn's TfidfVectorizer on the smoke US shard (0.738 vs 0.736 recall@20).
+
+config.TFIDF_MAX_DF may be a fraction; fit() resolves it against the number of pool
+texts being indexed (blocking.common.resolve_df), so the ceiling scales with the shard.
 """
 from typing import Iterator
 
@@ -24,7 +27,7 @@ import scipy.sparse as sp
 from sparse_dot_topn import sp_matmul_topn
 
 import config
-from blocking.common import empty, rank_within_entity
+from blocking.common import empty, rank_within_entity, resolve_df
 
 
 def char_ngrams(texts: pl.Series, ngram_range=config.TFIDF_NGRAM_RANGE) -> pl.DataFrame:
@@ -77,7 +80,8 @@ def _csr(rows: np.ndarray, cols: np.ndarray, data: np.ndarray, shape: tuple[int,
     return sp.csr_matrix((data, cols.astype(np.int32), indptr), shape=shape)
 
 
-def fit_vocab(grams: pl.DataFrame, n_docs: int, max_df=config.TFIDF_MAX_DF) -> pl.DataFrame:
+def fit_vocab(grams: pl.DataFrame, n_docs: int, max_df: int | None = None) -> pl.DataFrame:
+    """max_df is an absolute document count (resolve a fraction with resolve_df first)."""
     df = grams.group_by("h").len(name="df").filter(pl.col("df") >= config.TFIDF_MIN_DF)
     if max_df is not None:
         df = df.filter(pl.col("df") <= max_df)
@@ -97,14 +101,16 @@ def tfidf_matrix(grams: pl.DataFrame, vocab: pl.DataFrame, n_docs: int) -> sp.cs
 class SparseTopNIndex:
     """Exact sparse cosine top-k via sparse_dot_topn, queries processed in chunks.
     With max_df set, n-grams in more than max_df pool records are dropped first
-    (see config.TFIDF_MAX_DF): cosine over the remaining n-grams."""
+    (see config.TFIDF_MAX_DF): cosine over the remaining n-grams. max_df is a fraction
+    of the pool or a count; fit() stores the count it resolved to in max_df_resolved."""
 
     def __init__(self, max_df=config.TFIDF_MAX_DF, chunk_rows=config.TFIDF_CHUNK_ROWS, n_threads=config.BLOCKING_THREADS):
         self.max_df, self.chunk_rows, self.n_threads = max_df, chunk_rows, n_threads
 
     def fit(self, texts: pl.Series) -> "SparseTopNIndex":
         grams = char_ngrams(texts)
-        self.vocab = fit_vocab(grams, len(texts), self.max_df)
+        self.max_df_resolved = resolve_df(f"TFIDF_MAX_DF[{texts.name}]", self.max_df, len(texts))
+        self.vocab = fit_vocab(grams, len(texts), self.max_df_resolved)
         w = _weights(grams, self.vocab).sort("gid", "doc")
         # Stored transposed (vocab x pool): the right-hand operand of Q @ C.T.
         self.pool_t = _csr(w["gid"].to_numpy(), w["doc"].to_numpy(), w["w"].to_numpy(), (self.vocab.height, len(texts)))

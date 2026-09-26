@@ -3,7 +3,8 @@
 Tokens are namespaced by field ("n:" / "a:") so a name word only matches a name
 word. Document frequency counts distinct records over the whole shard (S1 + pool),
 and only tokens with config.RARE_TOKEN_DF_MIN <= df <= config.RARE_TOKEN_DF_MAX are
-indexed (df 1 can never form a pair). For each Source-1 entity, its
+indexed (df 1 can never form a pair). RARE_TOKEN_DF_MAX may be a fraction; it is
+resolved against the shard's S1 + pool record count (blocking.common.resolve_df). For each Source-1 entity, its
 config.RARE_TOKENS_PER_ENTITY rarest tokens are taken (lowest df, ties broken by
 token), and the pool postings of those tokens are unioned.
 
@@ -15,7 +16,7 @@ Source-1 rows are processed in chunks so the postings join stays bounded.
 import polars as pl
 
 import config
-from blocking.common import empty, rank_within_entity
+from blocking.common import empty, rank_within_entity, resolve_df
 
 NAME = "rare_token"
 
@@ -33,13 +34,17 @@ def _tokens(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def run(s1: pl.DataFrame, pool: pl.DataFrame) -> pl.DataFrame:
+def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFrame:
+    df_max = resolve_df("RARE_TOKEN_DF_MAX", config.RARE_TOKEN_DF_MAX, s1.height + pool.height)
+    in_range = pl.col("df") >= config.RARE_TOKEN_DF_MIN
+    if df_max is not None:
+        in_range &= pl.col("df") <= df_max
     s1_tok, pool_tok = _tokens(s1), _tokens(pool)
     df = (
         pl.concat([s1_tok.lazy(), pool_tok.lazy()])
         .group_by("tok")
         .len(name="df")
-        .filter(pl.col("df").is_between(config.RARE_TOKEN_DF_MIN, config.RARE_TOKEN_DF_MAX))
+        .filter(in_range)
         .collect(engine="streaming")
     )
     rarest = (

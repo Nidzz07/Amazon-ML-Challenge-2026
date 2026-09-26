@@ -25,12 +25,28 @@ Two exact_key diagnostics, because candidates only carry one exact_key bit:
                     exact_key: if recall at a K goes UP, those families are crowding
                     true pairs out of the cap.
 
+Blocking knobs can be overridden for one run without editing config.py:
+  --tfidf-max-df, --rare-token-df-max   fraction of the corpus ("0.2"), absolute count
+                                        ("20000") or "none"; see config.TFIDF_MAX_DF
+  --exact-key-max-bucket N, --tfidf-top-k N
+  --query-sample N                      block only N seeded-random Source-1 entities
+                                        (after --country and the validation filter);
+                                        the pool stays complete. rare_token df and
+                                        exact_key Source-1 bucket sizes then count only
+                                        the sampled entities, a small shift next to a
+                                        full-size pool.
+The report records the knobs, the ceiling each channel resolved per shard, per shard
+x channel seconds, wall-clock and peak RSS. Peak RSS only ever rises within a process,
+so run ONE configuration per invocation and compare reports across invocations.
+
 Writes artifacts[/smoke]/reports/<--report> (default cap_sweep.json). Does not write
 candidates.
 
 Usage:
     python sweep_candidate_cap.py [--smoke] [--input DIR] [--output DIR] [--report NAME] [--slots-k K] [--country C ...]
+        [--tfidf-max-df X] [--rare-token-df-max X] [--exact-key-max-bucket N] [--tfidf-top-k N] [--query-sample N]
 """
+import argparse
 import json
 import sys
 import time
@@ -52,6 +68,26 @@ SOURCES = ("name_tfidf", "addr_tfidf", "ek_state", "ek_other", "rare_token")
 SOURCE_BITS = {"name_tfidf": 1 << config.CHANNELS.index("name_tfidf"),
                "addr_tfidf": 1 << config.CHANNELS.index("addr_tfidf"),
                "rare_token": 1 << config.CHANNELS.index("rare_token")}
+# CLI flag -> config attribute it overrides for this run.
+KNOBS = {"tfidf_max_df": "TFIDF_MAX_DF", "rare_token_df_max": "RARE_TOKEN_DF_MAX",
+         "exact_key_max_bucket": "EXACT_KEY_MAX_BUCKET", "tfidf_top_k": "TFIDF_TOP_K"}
+
+
+def df_ceiling(s: str) -> int | float | None:
+    """'none' -> None, '0.2' -> fraction of the corpus, '20000' -> absolute count."""
+    if s.lower() == "none":
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        v = float(s)
+    if not 0.0 < v <= 1.0:
+        raise argparse.ArgumentTypeError(f"{s}: a fraction must be in (0, 1]; write a count as an integer")
+    return v
+
+
+def gb(n_bytes: int | None) -> float | None:
+    return None if n_bytes is None else n_bytes / 2**30
 
 
 def load_truth(in_dir, entities: pl.DataFrame) -> pl.DataFrame:
@@ -140,9 +176,25 @@ def main(argv=None) -> None:
     ap.add_argument("--country", action="append",
                     help="run only this country shard (repeatable). Shards are independent, so "
                          "per-country reports combine exactly; use it when all shards at once do not fit in RAM")
+    # SUPPRESS: the attribute exists only if the flag was given, so "none" still overrides.
+    knob = dict(default=argparse.SUPPRESS)
+    ap.add_argument("--tfidf-max-df", type=df_ceiling, **knob, help="override config.TFIDF_MAX_DF (fraction, count or none)")
+    ap.add_argument("--rare-token-df-max", type=df_ceiling, **knob,
+                    help="override config.RARE_TOKEN_DF_MAX (fraction, count or none)")
+    ap.add_argument("--exact-key-max-bucket", type=int, **knob, help="override config.EXACT_KEY_MAX_BUCKET (absolute)")
+    ap.add_argument("--tfidf-top-k", type=int, **knob, help="override config.TFIDF_TOP_K")
+    ap.add_argument("--query-sample", type=int, metavar="N",
+                    help="block only N random Source-1 entities (seed config.SEED); the pool stays complete")
     args = ap.parse_args(argv)
     in_dir, out_dir = pio.dirs(args)
     t0 = time.perf_counter()
+
+    given = {flag: getattr(args, flag) for flag in KNOBS if hasattr(args, flag)}
+    for flag, value in given.items():
+        setattr(config, KNOBS[flag], value)
+    knobs = {attr: getattr(config, attr) for attr in KNOBS.values()}
+    print("knobs: " + ", ".join(f"{k}={v!r}{' (override)' if a in given else ''}"
+                                for a, (k, v) in zip(KNOBS, knobs.items())))
 
     entities = pl.read_parquet(config.norm_path(SPLIT, config.SOURCE1_SRC, in_dir), columns=["entity_id", "country"])
     entities = entities.rename({"entity_id": "source1_entity_id"})
@@ -151,6 +203,10 @@ def main(argv=None) -> None:
         entities = entities.filter(pl.col("source1_entity_id").is_in(held_out.implode()))
     if args.country:
         entities = entities.filter(pl.col("country").is_in(args.country))
+    s1_ids = held_out
+    if args.query_sample is not None and args.query_sample < entities.height:
+        entities = entities.sort("source1_entity_id").sample(n=args.query_sample, seed=config.SEED)
+        s1_ids = entities["source1_entity_id"]
     truth = load_truth(in_dir, entities)
 
     pool = pl.concat(
@@ -160,11 +216,12 @@ def main(argv=None) -> None:
     cross = entities.height * pool.height
     cross_shard = entities.join(shard_pool, on="country", how="left")["pool"].fill_null(0).sum()
 
-    # Full runs block only the held-out Source-1 entities (against the complete pool).
-    long, _ = s2_block.channel_pairs(SPLIT, in_dir, s1_ids=held_out,
-                                     countries=entities["country"].unique().sort().to_list())
+    # Full runs block only the held-out (or sampled) Source-1 entities, against the complete pool.
+    long, stats = s2_block.channel_pairs(SPLIT, in_dir, s1_ids=s1_ids,
+                                         countries=entities["country"].unique().sort().to_list(), smoke=args.smoke)
     uncapped = s2_block.union(long).join(entities.select("source1_entity_id"), on="source1_entity_id", how="semi")
     t_block = time.perf_counter() - t0
+    rss_block = pio.peak_rss_bytes()
 
     # True pairs with the channels that retrieved them (0 = never retrieved).
     truth_ch = truth.join(uncapped.select(*KEYS, "channels", "n_channels"), on=KEYS, how="left").with_columns(
@@ -203,7 +260,7 @@ def main(argv=None) -> None:
             }
         rows.append(row)
 
-    flags, ablated_ek = exact_key_detail(in_dir, held_out, countries)
+    flags, ablated_ek = exact_key_detail(in_dir, s1_ids, countries)
     slots = slot_breakdown(s2_block.cap(uncapped, args.slots_k), flags, truth, entities)
     ablated_long = pl.concat([
         long.filter(pl.col("bit") != EK_BIT),
@@ -215,17 +272,26 @@ def main(argv=None) -> None:
     report = {
         "split": "smoke_train" if args.smoke else ("val" if held_out is not None else "train"),
         "entities": entities.height,
+        "query_sample": args.query_sample,
         "true_pairs": truth.height,
         "true_pairs_by_country": {c: truth.filter(pl.col("country") == c).height for c in countries},
         "pool": pool.height,
         "pool_by_country": dict(shard_pool.sort("country").iter_rows()),
+        "knobs": knobs,
+        "knob_overrides": sorted(KNOBS[f] for f in given),
+        # ceiling each channel resolved on each shard: {country: {knob[col]: {value, n_docs, resolved}}}
+        "resolved": {c: {k: v for s in stats if s["country"] == c for k, v in s["resolved"].items()} for c in countries},
+        "channel_sec": [{k: s[k] for k in ("country", "channel", "pairs", "entities", "sec")} for s in stats],
         "block_sec": t_block,
+        "peak_rss_gb_block": gb(rss_block),
         "sweep": rows,
         "state_families": [list(f) for f in STATE_FAMILIES],
         "slots_k": args.slots_k,
         "slots_at_k": slots,
         "ablate_state": ablate_rows,
     }
+    report["wall_sec"] = time.perf_counter() - t0
+    report["peak_rss_gb"] = gb(pio.peak_rss_bytes())
     out = out_dir / config.REPORTS_DIRNAME / args.report
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2), encoding=config.ENCODING)
@@ -261,7 +327,14 @@ def main(argv=None) -> None:
             tr = "-" if v["only_true_rate"] is None else f"{v['only_true_rate']:.3f}"
             print(f"    {src:<11} any {v['share_any']:.3f}  only {v['share_only']:.3f}  "
                   f"({v['only_slots']:>7,} slots, true {tr})")
-    print(f"\nwrote {out}  ({time.perf_counter() - t0:.1f}s)")
+    print("\nresolved df ceilings:")
+    for c, res in report["resolved"].items():
+        print(f"  {c}: " + ", ".join(f"{k} {v['value']!r} x {v['n_docs']:,} -> {v['resolved']!r}" for k, v in res.items()))
+    fmt_gb = lambda v: "n/a" if v is None else f"{v:.2f} GB"  # noqa: E731
+    print(f"knobs {knobs}")
+    print(f"wall {report['wall_sec']:.1f}s (blocking {t_block:.1f}s), peak RSS {fmt_gb(report['peak_rss_gb'])} "
+          f"(after blocking {fmt_gb(report['peak_rss_gb_block'])})")
+    print(f"\nwrote {out}")
 
 
 if __name__ == "__main__":

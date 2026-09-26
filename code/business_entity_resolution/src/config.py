@@ -128,7 +128,10 @@ CHANNELS = ("name_tfidf", "addr_tfidf", "exact_key", "rare_token", "embed_ann")
 # validation split once normalisation and embed_ann are real, since smoke
 # under-represents full-scale candidate competition per entity.
 MAX_CANDIDATES_PER_ENTITY = 30
-EXACT_KEY_MAX_BUCKET = 500
+# Absolute on purpose, never a fraction: a key with n Source-1 and m pool records emits
+# n x m pairs, so a ceiling that grew with the shard would let one key emit hundreds of
+# millions. A key over this on EITHER side is dropped. Tunable (sweep --exact-key-max-bucket).
+EXACT_KEY_MAX_BUCKET = 5_000
 
 # Assembly (S6). How the empty prediction (m = 0) is scored in the expected-F0.5
 # prefix search; m >= 1 always uses the plug-in 1.25*c_hat / (0.25*k_hat + m).
@@ -143,10 +146,15 @@ BLOCKING_THREADS = max(1, (os.cpu_count() or 2) - 1)
 TFIDF_BACKEND = "sparse_topn"  # exact sparse cosine; an "svd_faiss" backend can slot in behind the same interface
 TFIDF_NGRAM_RANGE = (3, 4)
 TFIDF_MIN_DF = 2
-# Drop n-grams in more than this many pool records before the top-k multiply.
-# The walk over common n-grams dominates query cost (the most frequent covers ~20% of
-# a shard); None = exact cosine.
-TFIDF_MAX_DF = 20_000
+# Document-frequency ceilings (TFIDF_MAX_DF, RARE_TOKEN_DF_MAX): a float in (0, 1] is a
+# FRACTION of the corpus the df is counted over, resolved per country shard when the
+# index is built (blocking.common.resolve_df, which logs the resolved count); an int is
+# an absolute count; None = no ceiling. Fractions keep the cut the same on the smoke
+# sample and at full scale: the old absolute 20,000 dropped nothing on the 93k-record
+# smoke India pool but 71% of each query's name n-grams on the 4.13M full India pool.
+# Drop n-grams in more than this share of the (non-empty) pool records before the top-k
+# multiply. The walk over common n-grams dominates query cost; None = exact cosine.
+TFIDF_MAX_DF = 0.20
 TFIDF_TOP_K = 20
 TFIDF_CHUNK_ROWS = 20_000
 # city_norm / state_canon are filled by normalise.parse_address_components. street_num
@@ -159,13 +167,23 @@ EXACT_KEY_FAMILIES = (
     ("street_num", "state_canon"),
 )
 RARE_TOKEN_DF_MIN = 2
-RARE_TOKEN_DF_MAX = 5_000
+# Share of the shard's S1 + pool records (see the df ceilings note above TFIDF_MAX_DF).
+RARE_TOKEN_DF_MAX = 0.04
 RARE_TOKENS_PER_ENTITY = 3
 RARE_TOKEN_CHUNK_ROWS = 50_000
 # Per-entity cap on this channel's own output (ranked by shared rare tokens, then rarity).
-# Uncapped, three tokens at df<=5000 can yield ~15k postings per entity.
+# Uncapped, three tokens at the df ceiling can yield ~15k postings per entity.
 RARE_TOKEN_TOP_K = 100
-# Precomputed embedding ANN pairs (Tanuj, Gate 3). None until the path is fixed;
-# embed_ann returns zero candidates while it is None or missing.
+# Precomputed embedding ANN pairs, written by s2a_embed.py (Tanuj). Full-scale runs read
+# EMBED_ANN_PATH, or artifacts/embed_ann_pairs.parquet while it is None. Smoke runs always
+# read artifacts/smoke/embed_ann_pairs.parquet, so a smoke run can never pick up
+# full-scale pairs. embed_ann returns zero candidates while the file is missing.
+EMBED_ANN_FILENAME = "embed_ann_pairs.parquet"
 EMBED_ANN_PATH = None
 EMBED_TOP_K = 20
+
+
+def embed_ann_path(smoke: bool) -> Path:
+    if smoke:
+        return SMOKE_ARTIFACTS_DIR / EMBED_ANN_FILENAME
+    return Path(EMBED_ANN_PATH) if EMBED_ANN_PATH is not None else ARTIFACTS_DIR / EMBED_ANN_FILENAME

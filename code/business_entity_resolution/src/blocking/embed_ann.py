@@ -1,52 +1,41 @@
-"""Channel embed_ann: multilingual embedding ANN (Tanuj, Gate 3). PLACEHOLDER.
+"""Channel embed_ann: multilingual embedding ANN pairs precomputed by s2a_embed.py (Tanuj).
 
-Same interface as the other channels. Until config.EMBED_ANN_PATH points at an
-existing file it logs that embeddings are not yet available and returns zero
-candidates. s2_block needs no special case for it.
+Reads config.embed_ann_path(smoke): artifacts/smoke/embed_ann_pairs.parquet on smoke
+runs, config.EMBED_ANN_PATH (default artifacts/embed_ann_pairs.parquet) otherwise.
+The smoke flag comes from the caller, never from the shard's size. While the file is
+missing it logs that and returns zero candidates, so the pipeline runs without it.
 
-When the embeddings land, implement _load() to return precomputed ANN pairs
-(source1_entity_id, candidate_entity_id, score) and filter them to this shard.
+The file holds every split and country shard, with channel_rank / channel_score
+already set. A pair is kept only if its Source-1 id is in this shard's s1 AND its
+candidate is in this shard's pool, and only ranks up to config.EMBED_TOP_K. The pool
+filter means a pairs file built from a different artifact set can never emit
+candidates the pool does not contain (s3 would turn those into all-null rows).
 """
-from pathlib import Path
-
 import polars as pl
 
 import config
-from blocking.common import empty
+from blocking.common import CHANNEL_SCHEMA, empty
 
 NAME = "embed_ann"
 
 
-def _available(in_dir) -> bool:
-    return (in_dir / "embed_ann_pairs.parquet").exists()
-
-
-def run(s1: pl.DataFrame, pool: pl.DataFrame) -> pl.DataFrame:
-    # We infer the in_dir, split, and country from the input dataframes since this is
-    # called per shard inside s2_block.py.
-    # The true in_dir isn't passed directly to run(), but we can check ARTIFACTS_DIR/smoke.
-    country = s1["country"][0]
-    
-    # We assume if s1 is small, it's a smoke run (or we can just check if smoke file exists)
-    if (config.SMOKE_DIR / "embed_ann_pairs.parquet").exists() and s1.height <= 50000:
-        in_dir = config.SMOKE_DIR
-    else:
-        in_dir = config.ARTIFACTS_DIR
-        
-    if not _available(in_dir):
-        print(f"  embed_ann: embeddings not yet available (embed_ann_pairs.parquet), 0 candidates")
+def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFrame:
+    if s1.is_empty() or pool.is_empty():
         return empty()
-        
-    # Read the precomputed file
-    df = pl.scan_parquet(in_dir / "embed_ann_pairs.parquet")
-    
-    # Filter to this country (split is implicit since s1 only contains one split's entities)
-    s1_ids = s1.select("entity_id").rename({"entity_id": "source1_entity_id"})
-    
-    # Join to keep only the pairs for the requested s1 entities
-    # This automatically filters to the correct split and country shard
-    res = df.join(s1_ids.lazy(), on="source1_entity_id", how="inner").select([
-        "source1_entity_id", "candidate_entity_id", "channel_rank", "channel_score"
-    ]).collect()
-    
-    return res
+    path = config.embed_ann_path(smoke)
+    if not path.exists():
+        print(f"    embed_ann: {path} not found, 0 candidates")
+        return empty()
+    pairs = (
+        pl.scan_parquet(path)
+        .filter(pl.col("channel_rank") <= config.EMBED_TOP_K)
+        .join(s1.lazy().select(pl.col("entity_id").alias("source1_entity_id")), on="source1_entity_id", how="semi")
+        .select(list(CHANNEL_SCHEMA))
+        .collect()
+        .cast(CHANNEL_SCHEMA)
+    )
+    out = pairs.join(pool.select(pl.col("entity_id").alias("candidate_entity_id")), on="candidate_entity_id", how="semi")
+    if out.height < pairs.height:
+        print(f"    embed_ann: dropped {pairs.height - out.height:,} of {pairs.height:,} pairs whose candidate "
+              f"is not in this shard's pool (is {path} from a different artifact set?)")
+    return out
