@@ -1,10 +1,11 @@
 """Shared plumbing for stages s1-s7: CLI flags, directory resolution, schema checks,
-and the submission TSV writer. No stage logic lives here."""
+the submission TSV writer and the shared train-entity sampler. No stage logic lives here."""
 import argparse
 import subprocess
 import sys
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 
 import config
@@ -92,6 +93,39 @@ def val_ids(smoke: bool) -> pl.Series | None:
     if smoke or not config.VAL_ENTITY_IDS.exists():
         return None
     return pl.read_parquet(config.VAL_ENTITY_IDS)["entity_id"]
+
+
+def sample_train_entities(s1: pl.DataFrame, n: int, split: str, smoke: bool,
+                          seed: int = config.SEED) -> pl.Series:
+    """The ONE train-entity sampler; every stage that subsamples train imports this, so
+    they can never sample different entity sets. s1 has entity_id and country.
+
+    Returns the sorted entity_ids to use: every held-out validation entity (val_ids(smoke),
+    looked up here so no caller can forget or substitute it; none on smoke) plus n of the
+    others, stratified by country: each country gets n x its share of the others, floored,
+    with the leftover handed out by largest remainder (ties by country name). Within a
+    country the draw is over sorted ids, countries in sorted order, from one numpy
+    default_rng(seed), so it depends only on the id set and seed. n <= 0 or n >= the
+    number of others returns every id. Never call it on test."""
+    assert split == "train", f"sample_train_entities called on split {split!r}: test must never be sampled"
+    keep = val_ids(smoke)
+    assert smoke or keep is not None, f"{config.VAL_ENTITY_IDS} missing: run validation_split.py first"
+    ids = s1.select("entity_id", "country")
+    kept = ids.filter(pl.col("entity_id").is_in(keep.implode())) if keep is not None else ids.head(0)
+    rest = ids.join(kept, on="entity_id", how="anti") if keep is not None else ids
+    if n <= 0 or n >= rest.height:
+        return ids["entity_id"].sort()
+    counts = rest.group_by("country").len().sort("country")
+    exact = counts["len"].to_numpy().astype(np.int64) * n / rest.height  # u32 x 800k overflows
+    quota = np.floor(exact).astype(np.int64)
+    order = np.lexsort((np.arange(len(quota)), -(exact - quota)))  # largest remainder, ties by country order
+    quota[order[: n - int(quota.sum())]] += 1
+    rng = np.random.default_rng(seed)
+    picked = []
+    for country, q in zip(counts["country"], quota):
+        pool = rest.filter(pl.col("country") == country)["entity_id"].sort()
+        picked.append(pool.gather(np.sort(rng.choice(len(pool), size=int(q), replace=False))))
+    return pl.concat([kept["entity_id"], *picked]).sort()
 
 
 def git_sha() -> str:

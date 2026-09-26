@@ -22,6 +22,7 @@ A record, pool or query, whose every n-gram is over the ceiling keeps its
 config.TFIDF_EMPTY_FALLBACK_NGRAMS lowest-df n-grams instead of an empty vector
 (fallback_weights); the counts are logged via blocking.common.note.
 """
+import time
 from typing import Iterator
 
 import numpy as np
@@ -207,8 +208,13 @@ class SparseTopNIndex:
     def search(self, texts: pl.Series, k: int) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         q_full = self.query_matrix(texts)
         pool_slices = list(range(0, self._pool_len, self.POOL_CHUNK_DOCS))
+        n_total, t0 = q_full.shape[0], time.perf_counter()
 
         for q_start in range(0, q_full.shape[0], self.chunk_rows):
+            if q_start:  # progress for multi-hour full-scale runs: one line per query chunk
+                sec = time.perf_counter() - t0
+                print(f"      [{self.name}] {q_start:,}/{n_total:,} queries  {sec:,.0f}s  "
+                      f"eta {sec / q_start * (n_total - q_start):,.0f}s", flush=True)
             q_chunk = q_full[q_start: q_start + self.chunk_rows]
             n_q = q_chunk.shape[0]
 
