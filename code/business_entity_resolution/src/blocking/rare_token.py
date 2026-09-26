@@ -21,24 +21,26 @@ NAME = "rare_token"
 
 
 def _tokens(df: pl.DataFrame) -> pl.DataFrame:
-    name = df.select("entity_id", pl.col("name_tokens").alias("tok"), pl.lit("n:").alias("ns"))
-    addr = df.select("entity_id", pl.col("addr_tokens").alias("tok"), pl.lit("a:").alias("ns"))
+    name = df.lazy().select("entity_id", pl.col("name_tokens").alias("tok"), pl.lit("n:").alias("ns"))
+    addr = df.lazy().select("entity_id", pl.col("addr_tokens").alias("tok"), pl.lit("a:").alias("ns"))
     return (
         pl.concat([name, addr])
         .explode("tok", empty_as_null=False)
         .filter(pl.col("tok").is_not_null() & (pl.col("tok") != ""))
         .select("entity_id", (pl.col("ns") + pl.col("tok")).alias("tok"))
         .unique()
+        .collect(engine="streaming")
     )
 
 
 def run(s1: pl.DataFrame, pool: pl.DataFrame) -> pl.DataFrame:
     s1_tok, pool_tok = _tokens(s1), _tokens(pool)
     df = (
-        pl.concat([s1_tok, pool_tok])
+        pl.concat([s1_tok.lazy(), pool_tok.lazy()])
         .group_by("tok")
         .len(name="df")
         .filter(pl.col("df").is_between(config.RARE_TOKEN_DF_MIN, config.RARE_TOKEN_DF_MAX))
+        .collect(engine="streaming")
     )
     rarest = (
         s1_tok.join(df, on="tok", how="inner")

@@ -106,6 +106,22 @@ def _add_context_and_competition(cands: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def _load_embed_scores(split: str, in_dir) -> pl.DataFrame | None:
+    """Load precomputed embedding cosine scores if available."""
+    embed_path = in_dir / "embed_ann_pairs.parquet"
+    if not embed_path.exists():
+        return None
+    df = pl.read_parquet(embed_path)
+    # Filter to the requested split if split column exists
+    if "split" in df.columns:
+        df = df.filter(pl.col("split") == split)
+    return df.select(
+        "source1_entity_id", "candidate_entity_id",
+        pl.col("channel_score").alias("embed_cosine"),
+        pl.col("channel_rank").cast(pl.Float32).alias("embed_rank"),
+    )
+
+
 def build_pairs(split: str, in_dir) -> pl.DataFrame:
     """Join candidates with normalised data from both sides and add
     context/competition columns.  Returns the DataFrame ready for
@@ -124,6 +140,22 @@ def build_pairs(split: str, in_dir) -> pl.DataFrame:
 
     # Join candidate normalised data
     pairs = pairs.join(pool_norm, left_on="candidate_entity_id", right_on="entity_id", how="left")
+
+    # Join embedding cosine scores (Tanuj B5) — zero-filled if not yet available
+    embed_scores = _load_embed_scores(split, in_dir)
+    if embed_scores is not None:
+        pairs = pairs.join(embed_scores, on=["source1_entity_id", "candidate_entity_id"], how="left")
+        pairs = pairs.with_columns([
+            pl.col("embed_cosine").fill_null(0.0),
+            pl.col("embed_rank").fill_null(0.0),
+        ])
+        print(f"  embed_ann scores joined: {pairs['embed_cosine'].gt(0).sum():,}/{len(pairs):,} pairs have embeddings")
+    else:
+        pairs = pairs.with_columns([
+            pl.lit(0.0, dtype=pl.Float32).alias("embed_cosine"),
+            pl.lit(0.0, dtype=pl.Float32).alias("embed_rank"),
+        ])
+        print("  embed_ann: no precomputed scores found, embed_cosine/rank = 0")
 
     return pairs
 

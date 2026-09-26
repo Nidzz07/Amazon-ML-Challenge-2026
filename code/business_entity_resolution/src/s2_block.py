@@ -81,12 +81,12 @@ def channel_pairs(split: str, in_dir, verbose: bool = True, s1_ids: pl.Series | 
 
 def union(long: pl.DataFrame) -> pl.DataFrame:
     """One row per pair in the candidates schema, uncapped."""
-    return long.group_by("source1_entity_id", "candidate_entity_id").agg(
+    return long.lazy().group_by("source1_entity_id", "candidate_entity_id").agg(
         pl.col("bit").sum().cast(pl.UInt8).alias("channels"),  # each channel emits a pair at most once, so sum == OR
         pl.len().cast(pl.UInt8).alias("n_channels"),
         pl.col("channel_rank").min().alias("best_rank"),
         (1.0 / pl.col("channel_rank").cast(pl.Float64)).sum().cast(pl.Float32).alias("prior_score"),
-    )
+    ).collect(engine="streaming")
 
 
 def cap(cands: pl.DataFrame, n: int = config.MAX_CANDIDATES_PER_ENTITY) -> pl.DataFrame:

@@ -110,11 +110,14 @@ FEATURE_SPEC: list[tuple[str, int]] = [
     ("cand_best_score",    0),
     ("cand_n_claims",      0),
     ("cand_is_argmax",     1),
+    # ── Embedding ANN features (2) — Tanuj, B5 ──────────────────────
+    ("embed_cosine",       1),   # cosine similarity from FAISS search (0 if not in ANN)
+    ("embed_rank",        -1),   # rank within entity in ANN channel (0 if not in ANN)
 ]
 
 FEATURE_NAMES: tuple[str, ...] = tuple(n for n, _ in FEATURE_SPEC)
 FEATURE_MONO: tuple[int, ...] = tuple(d for _, d in FEATURE_SPEC)
-FEATURE_VERSION: int = 1
+FEATURE_VERSION: int = 2
 NUM_FEATURES: int = len(FEATURE_NAMES)
 
 # Channel bit positions (must match config.CHANNELS order)
@@ -503,6 +506,12 @@ def featurise(pairs: "pl.DataFrame") -> np.ndarray:
         _col_np("cand_best_score"),
         _col_np("cand_n_claims"),
     ))
+
+    # ── Embedding ANN features (2) — Tanuj, B5 ──────────────────────
+    embed = np.zeros((n, 2), dtype=np.float32)
+    embed[:, 0] = _col_np("embed_cosine")   # 0.0 if pair not in ANN output
+    embed[:, 1] = _col_np("embed_rank")     # 0.0 if pair not in ANN output
+    blocks.append(embed)
 
     result = np.hstack(blocks)
     assert result.shape == (n, NUM_FEATURES), f"shape {result.shape} != ({n}, {NUM_FEATURES})"

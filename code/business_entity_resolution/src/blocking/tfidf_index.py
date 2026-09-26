@@ -29,23 +29,33 @@ from blocking.common import empty, rank_within_entity
 
 def char_ngrams(texts: pl.Series, ngram_range=config.TFIDF_NGRAM_RANGE) -> pl.DataFrame:
     """(doc u32, h u64, tf u32): one row per distinct n-gram hash per text."""
-    words = (
-        pl.DataFrame({"text": texts})
-        .lazy()
-        .with_row_index("doc")
-        .select("doc", pl.col("text").str.extract_all(r"\S+").alias("w"))
-        .explode("w", empty_as_null=False)
-        .filter(pl.col("w").is_not_null() & (pl.col("w") != ""))
-        .select("doc", (" " + pl.col("w") + " ").alias("w"))
-        .with_columns(pl.col("w").str.len_chars().alias("L"))
-    )
-    grams = [
-        words.with_columns(pl.int_ranges(0, pl.max_horizontal(pl.col("L") - n + 1, 1)).alias("off"))
-        .explode("off", empty_as_null=False)
-        .select("doc", pl.col("w").str.slice(pl.col("off"), n).hash(seed=0).alias("h"))
-        for n in range(ngram_range[0], ngram_range[1] + 1)
-    ]
-    return pl.concat(grams).group_by("doc", "h").len(name="tf").collect(engine="streaming")
+    chunk_size = 50_000
+    all_chunks = []
+    
+    for offset in range(0, len(texts), chunk_size):
+        chunk_texts = texts.slice(offset, chunk_size)
+        words = (
+            pl.DataFrame({"text": chunk_texts})
+            .lazy()
+            .with_row_index("doc", offset=offset)
+            .select("doc", pl.col("text").str.extract_all(r"\S+").alias("w"))
+            .explode("w", empty_as_null=False)
+            .filter(pl.col("w").is_not_null() & (pl.col("w") != ""))
+            .select("doc", (" " + pl.col("w") + " ").alias("w"))
+            .with_columns(pl.col("w").str.len_chars().alias("L"))
+        )
+        grams = [
+            words.with_columns(pl.int_ranges(0, pl.max_horizontal(pl.col("L") - n + 1, 1)).alias("off"))
+            .explode("off", empty_as_null=False)
+            .select("doc", pl.col("w").str.slice(pl.col("off"), n).hash(seed=0).alias("h"))
+            for n in range(ngram_range[0], ngram_range[1] + 1)
+        ]
+        chunk_res = pl.concat(grams).group_by("doc", "h").len(name="tf").collect(engine="streaming")
+        all_chunks.append(chunk_res)
+        
+    if not all_chunks:
+        return pl.DataFrame(schema={"doc": pl.UInt32, "h": pl.UInt64, "tf": pl.UInt32})
+    return pl.concat(all_chunks)
 
 
 def _weights(grams: pl.DataFrame, vocab: pl.DataFrame) -> pl.DataFrame:
