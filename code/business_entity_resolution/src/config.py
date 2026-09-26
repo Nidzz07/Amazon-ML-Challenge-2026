@@ -190,6 +190,10 @@ TFIDF_MAX_DF = 0.01
 TFIDF_EMPTY_FALLBACK_NGRAMS = 5
 TFIDF_TOP_K = 20
 TFIDF_CHUNK_ROWS = 20_000
+# The pool index is fitted in slices of this many records (two passes: document frequency,
+# then weights), so the whole pool's n-gram frame never exists at once. Bounds fit memory;
+# the fitted index does not depend on it.
+TFIDF_FIT_CHUNK_DOCS = 500_000
 # city_norm / state_canon are filled by normalise.parse_address_components. street_num
 # is the verbatim house-number token ("8-2-293/82/c/16/a"), so (street_num, state_canon)
 # is specific enough to key on; oversized buckets are dropped by EXACT_KEY_MAX_BUCKET.

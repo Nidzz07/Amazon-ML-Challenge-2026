@@ -34,17 +34,18 @@ import config
 from blocking.common import empty, note, rank_within_entity, resolve_df
 
 
-def char_ngrams(texts: pl.Series, ngram_range=config.TFIDF_NGRAM_RANGE) -> pl.DataFrame:
-    """(doc u32, h u64, tf u32): one row per distinct n-gram hash per text."""
+def char_ngrams(texts: pl.Series, ngram_range=config.TFIDF_NGRAM_RANGE, doc_offset: int = 0) -> pl.DataFrame:
+    """(doc u32, h u64, tf u32): one row per distinct n-gram hash per text. doc numbers
+    start at doc_offset, so a slice of a larger corpus keeps its global doc numbers."""
     chunk_size = 50_000
     all_chunks = []
-    
+
     for offset in range(0, len(texts), chunk_size):
         chunk_texts = texts.slice(offset, chunk_size)
         words = (
             pl.DataFrame({"text": chunk_texts})
             .lazy()
-            .with_row_index("doc", offset=offset)
+            .with_row_index("doc", offset=doc_offset + offset)
             .select("doc", pl.col("text").str.extract_all(r"\S+").alias("w"))
             .explode("w", empty_as_null=False)
             .filter(pl.col("w").is_not_null() & (pl.col("w") != ""))
@@ -153,21 +154,43 @@ class SparseTopNIndex:
     def fit(self, texts: pl.Series) -> "SparseTopNIndex":
         """Vocabulary columns: the n-grams under the ceiling (gid 0..V-1, exactly as
         without the fallback), then the n-grams restored for empty pool records (gid V..).
-        Only fallback records carry the extra columns, so every other vector is unchanged."""
-        grams = char_ngrams(texts)
+        Only fallback records carry the extra columns, so every other vector is unchanged.
+
+        Two passes over slices of config.TFIDF_FIT_CHUNK_DOCS records, so the whole pool's
+        n-gram frame (~290M rows on the full US address pool) never exists at once:
+          1. document frequency: per-slice counts, summed. Counts add, so df, the
+             vocabulary and the IDF are exactly what one pass over everything gives.
+          2. weights and fallback, slice by slice, n-grams regenerated. Both are per
+             record given the vocabulary, so each record's vector is unchanged.
+        Pass 2 regenerates the n-grams rather than keeping pass 1's: keeping them is
+        exactly the memory this avoids."""
         n_docs = len(texts)
+        step = max(1, config.TFIDF_FIT_CHUNK_DOCS)
+        slices = range(0, n_docs, step)
         self.name = texts.name
         self.max_df_resolved = resolve_df(f"TFIDF_MAX_DF[{texts.name}]", self.max_df, n_docs)
-        df = doc_freq(grams)
-        self.vocab = fit_vocab(grams, n_docs, self.max_df_resolved, df)
+        df = None
+        for off in slices:
+            part = char_ngrams(texts.slice(off, step)).group_by("h").len(name="df")
+            df = part if df is None else pl.concat([df, part]).group_by("h").agg(pl.col("df").sum())
+        if df is None:
+            df = pl.DataFrame(schema={"h": pl.UInt64, "df": pl.UInt32})
+        df = df.with_columns(pl.col("df").cast(pl.UInt32)).filter(pl.col("df") >= config.TFIDF_MIN_DF)
+        self.vocab = fit_vocab(None, n_docs, self.max_df_resolved, df)
         over = df.head(0) if self.max_df_resolved is None else df.filter(pl.col("df") > self.max_df_resolved)
         self._over_ceiling = over.select("h", "df", _idf(n_docs).alias("idf"))
-        pool_fb = fallback_weights(grams, self.vocab, self._over_ceiling, self.fallback_n)
+        del df, over
+        core, fb = [], []
+        for off in slices:
+            grams = char_ngrams(texts.slice(off, step), doc_offset=off)
+            core.append(_weights(grams, self.vocab))
+            fb.append(fallback_weights(grams, self.vocab, self._over_ceiling, self.fallback_n))
+            del grams
+        pool_fb = pl.concat(fb) if fb else pl.DataFrame(schema={"doc": pl.UInt32, "h": pl.UInt64, "w": pl.Float32})
         self.fb_vocab = pool_fb.select("h").unique().sort("h").with_row_index("gid", offset=self.vocab.height)
         self.n_cols = self.vocab.height + self.fb_vocab.height
         pool_fb = pool_fb.join(self.fb_vocab, on="h", how="inner").select("doc", "gid", "w")
-        # Weights are per doc, so computing them once here equals computing them per slice.
-        self._pool_w = pl.concat([_weights(grams, self.vocab), pool_fb])
+        self._pool_w = pl.concat([*core, pool_fb]) if core else pool_fb
         self._pool_len = n_docs
         self.fallback_stats = {
             "pool_docs": n_docs,
@@ -188,34 +211,47 @@ class SparseTopNIndex:
             (self.n_cols, n_slice)
         )
 
-    def query_matrix(self, texts: pl.Series) -> sp.csr_matrix:
-        """queries x n_cols; queries with no n-gram under the ceiling get the fallback."""
+    def _query_block(self, texts: pl.Series) -> tuple[sp.csr_matrix, dict]:
+        """queries x n_cols for `texts` (rows local to the block), plus fallback counts.
+        Every row is computed from that query alone, so blocks stack to the full matrix."""
         grams = char_ngrams(texts)
         core = _weights(grams, self.vocab)
         # Normalised over all n restored n-grams, THEN mapped to pool columns (see fallback_weights).
         fb_h = fallback_weights(grams, self.vocab, self._over_ceiling, self.fallback_n)
         fb = fb_h.join(self.fb_vocab, on="h", how="inner").select("doc", "gid", "w")
         w = pl.concat([core, fb]).sort("doc", "gid")
-        note(f"TFIDF_FALLBACK[{self.name}]", {
-            **self.fallback_stats,
+        counts = {
             "query_docs": len(texts),
             "query_fallback": fb_h["doc"].n_unique(),
             "query_fallback_matchable": fb["doc"].n_unique(),  # kept >= 1 n-gram some pool fallback record has
             "query_still_empty": len(texts) - w["doc"].n_unique(),
-        })
-        return _csr(w["doc"].to_numpy(), w["gid"].to_numpy(), w["w"].to_numpy(), (len(texts), self.n_cols))
+        }
+        return _csr(w["doc"].to_numpy(), w["gid"].to_numpy(), w["w"].to_numpy(), (len(texts), self.n_cols)), counts
+
+    def _note_queries(self, counts: dict) -> None:
+        note(f"TFIDF_FALLBACK[{self.name}]", {**self.fallback_stats, **counts})
+
+    def query_matrix(self, texts: pl.Series) -> sp.csr_matrix:
+        """queries x n_cols; queries with no n-gram under the ceiling get the fallback.
+        Builds every query at once: search() uses _query_block per chunk instead."""
+        m, counts = self._query_block(texts)
+        self._note_queries(counts)
+        return m
 
     def search(self, texts: pl.Series, k: int) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        q_full = self.query_matrix(texts)
+        """Query vectors are built one chunk of chunk_rows at a time, so only that chunk's
+        n-grams are ever in memory (all 1.32M US queries at once was ~3.5 GB)."""
         pool_slices = list(range(0, self._pool_len, self.POOL_CHUNK_DOCS))
-        n_total, t0 = q_full.shape[0], time.perf_counter()
+        n_total, t0 = len(texts), time.perf_counter()
+        totals = dict.fromkeys(("query_docs", "query_fallback", "query_fallback_matchable", "query_still_empty"), 0)
 
-        for q_start in range(0, q_full.shape[0], self.chunk_rows):
+        for q_start in range(0, n_total, self.chunk_rows):
             if q_start:  # progress for multi-hour full-scale runs: one line per query chunk
                 sec = time.perf_counter() - t0
                 print(f"      [{self.name}] {q_start:,}/{n_total:,} queries  {sec:,.0f}s  "
                       f"eta {sec / q_start * (n_total - q_start):,.0f}s", flush=True)
-            q_chunk = q_full[q_start: q_start + self.chunk_rows]
+            q_chunk, counts = self._query_block(texts.slice(q_start, self.chunk_rows))
+            totals = {c: totals[c] + counts[c] for c in totals}
             n_q = q_chunk.shape[0]
 
             # Collect top-k across pool slices then merge.
@@ -252,6 +288,7 @@ class SparseTopNIndex:
                 best_cols[qi_idx, rank_idx],
                 best_scores[qi_idx, rank_idx],
             )
+        self._note_queries(totals)
 
 
 # Factories read config at call time, so a knob changed at runtime takes effect.

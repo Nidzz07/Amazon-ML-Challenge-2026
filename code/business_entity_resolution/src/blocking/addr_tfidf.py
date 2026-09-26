@@ -6,6 +6,8 @@ import config
 from blocking.tfidf_index import tfidf_channel
 
 NAME = "addr_tfidf"
+# The only norm columns run() reads; s2_block loads just these for this channel.
+COLUMNS = ("entity_id", "has_addr", "addr_roman")
 
 
 def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFrame:

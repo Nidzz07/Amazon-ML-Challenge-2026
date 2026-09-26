@@ -19,6 +19,9 @@ import config
 from blocking.common import empty, rank_within_entity, resolve_df
 
 NAME = "rare_token"
+# The only norm columns run() reads; s2_block loads just these. s1.height + pool.height
+# (the df ceiling's corpus size) does not depend on which columns are loaded.
+COLUMNS = ("entity_id", "name_tokens", "addr_tokens")
 
 
 def _tokens(df: pl.DataFrame) -> pl.DataFrame:

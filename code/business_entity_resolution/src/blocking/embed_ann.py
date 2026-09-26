@@ -17,6 +17,8 @@ import config
 from blocking.common import CHANNEL_SCHEMA, empty
 
 NAME = "embed_ann"
+# The only norm column run() reads; s2_block loads just this.
+COLUMNS = ("entity_id",)
 
 
 def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFrame:
