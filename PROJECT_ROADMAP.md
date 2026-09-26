@@ -154,7 +154,7 @@ These are the entire interface between the four of you. Anyone may change code i
 
 **`records_{split}_{src}.parquet`** — `entity_id` str, `business_name` str, `business_address` str, `country` str.
 
-**`norm_{split}_{src}.parquet`** — `entity_id` str, `name_norm` str, `name_roman` str, `name_tokens` list[str], `name_acronym` str, `addr_norm` str, `addr_roman` str, `addr_tokens` list[str], `street_num` str, `city_norm` str, `state_canon` str, `postcode` str, `country` str, `has_addr` bool, `script` uint8.
+**`norm_{split}_{src}.parquet`** — `entity_id` str, `name_norm` str, `name_roman` str, `name_tokens` list[str], `name_acronym` str, `addr_norm` str, `addr_roman` str, `addr_tokens` list[str], `street_num` str, `city_norm` str, `state_canon` str, `postcode` str, `country` str, `has_addr` bool, `script` uint8, `name_suffix` str (the legal suffix stripped from `name_roman` during normalisation, e.g. `pvt ltd`, `inc`; empty string if none was stripped).
 
 **`candidates_{split}.parquet`** — `source1_entity_id` str, `candidate_entity_id` str, `channels` uint8 bitmask, `n_channels` uint8, `best_rank` uint16, `prior_score` float32.
 
@@ -493,3 +493,37 @@ no ground truth, so this analysis says nothing about French recall.
 
 Full sweep data: artifacts/smoke/reports/cap_sweep.json (gitignored,
 regenerate with src/sweep_candidate_cap.py --smoke).
+
+---
+
+### 2026-09-26 — Address parsing added to normalisation; cap sweep re-run pending
+
+The first real normaliser (romanisation, suffix stripping, punctuation-to-space)
+lifted cross-script name matching (name TF-IDF true-pair hits on Indian
+cross-script pairs: 141→1,201 on smoke) but regressed India blocking recall
+0.9805→0.9774. Cause: generic punctuation-to-space conversion split Indian
+house numbers like "8-2-293/82/c/16/a" and "b/2/83" into short, common number
+tokens, costing the address TF-IDF channel 1,114 India true pairs.
+
+Fix: address parsing added to normalise.py (parse_address_components),
+filling street_num (verbatim house-number token, never space-split),
+city_norm, state_canon (India/US lookup tables, including romanised
+native-script state names) and postcode. addr_roman now keeps hyphen/slash
+house numbers as one token. The legal suffix stripped from the name is now
+persisted as name_suffix. On smoke, blocking recall at cap 30: India
+0.9882, US 0.9936, overall 0.9914 (vs 0.9805 / 0.9926 / 0.9878 with the stub
+normaliser). Address TF-IDF recovered to parity with the stub (63,599 vs
+63,605 India true pairs).
+
+This revived the previously-dead city_norm exact-key families
+(street_num+city_norm, name_acronym+city_norm) and added a new
+street_num+state_canon family: exact_key true-pair hits went 112→47,924
+(India) and 8,048→83,358 (US). The postcode+street_num family is now
+effectively dead: the data has no real postcodes outside France, and the old
+postcode regex had been copying US house numbers.
+
+The candidate-cap sweep that chose K=30 predates these families, so it is
+being re-run. Caveats: street_num+state_canon is noisy (13% of its India pairs
+are true); India street_num/city_norm agree on only 66%/63% of true pairs
+(house-number drift, city vs district ambiguity); France has no region table,
+so its state_canon is empty.
