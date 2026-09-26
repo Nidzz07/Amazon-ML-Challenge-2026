@@ -44,16 +44,24 @@ def _get_texts(records_lf: pl.LazyFrame, norm_lf: pl.LazyFrame) -> pl.DataFrame:
     ])
     return df
 
-def embed_in_batches(model, texts: list[str], batch_size: int = BATCH_SIZE) -> np.ndarray:
+def embed_in_batches(model, texts: list[str], batch_size: int = BATCH_SIZE, checkpoint_prefix: str = None) -> np.ndarray:
     embeddings = []
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i+batch_size]
-        # normalize_embeddings=False because we will normalize the concatenated vector later
         emb = model.encode(batch, batch_size=batch_size, normalize_embeddings=False, convert_to_numpy=True, show_progress_bar=False)
         embeddings.append(emb)
+        
+        # Checkpointing
+        rows_processed = i + len(batch)
+        if checkpoint_prefix and rows_processed % CHECKPOINT_EVERY < batch_size and rows_processed >= CHECKPOINT_EVERY:
+            current_emb = np.vstack(embeddings)
+            checkpoint_path = f"{checkpoint_prefix}_chkpt_{rows_processed}.npy"
+            np.save(checkpoint_path, current_emb)
+            print(f"      [Checkpoint] Saved {rows_processed} rows to {checkpoint_path}")
+            
     return np.vstack(embeddings)
 
-def process_shard(split: str, country: str, in_dir: Path, out_dir: Path, model):
+def process_shard(split: str, country: str, in_dir: Path, out_dir: Path, model, base_out_path: Path):
     print(f"\n--- Shard: {split} / {country} ---")
     t0 = time.perf_counter()
     
@@ -71,11 +79,13 @@ def process_shard(split: str, country: str, in_dir: Path, out_dir: Path, model):
     if s1_df.height == 0 or pool_df.height == 0:
         return None
         
-    # Embed Pool (checkpointing logic would go here if saving vectors to disk, but we do it in memory for now)
+    chkpt_base = str(base_out_path.parent / f"embed_{split}_{country}")
+    
+    # Embed Pool
     print("  Embedding Pool (Names)...")
-    pool_name_emb = embed_in_batches(model, pool_df["name_text"].to_list())
+    pool_name_emb = embed_in_batches(model, pool_df["name_text"].to_list(), checkpoint_prefix=f"{chkpt_base}_pool_name")
     print("  Embedding Pool (Addresses)...")
-    pool_addr_emb = embed_in_batches(model, pool_df["addr_text"].to_list())
+    pool_addr_emb = embed_in_batches(model, pool_df["addr_text"].to_list(), checkpoint_prefix=f"{chkpt_base}_pool_addr")
     
     # Concatenate and normalize
     pool_emb = np.hstack([pool_name_emb, pool_addr_emb])
@@ -128,35 +138,70 @@ def main(argv=None) -> None:
     ap = pio.parser(__doc__)
     args = ap.parse_args(argv)
     in_dir, out_dir = pio.dirs(args)
-    
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Loading {MODEL_NAME} on {device}...")
     model = SentenceTransformer(MODEL_NAME, device=device)
-    
+
     out_path = config.EMBED_ANN_PATH
-    if out_path is None:
+    if out_path is None or args.smoke:
         out_path = out_dir / "embed_ann_pairs.parquet"
     else:
         out_path = Path(out_path)
-    
-    all_pairs = []
-    
+
+    # Per-shard parquets go in a subdirectory next to the final output.
+    # If the final output already exists, we're done.
+    if out_path.exists():
+        print(f"\nFinal output already exists at {out_path}. Nothing to do.")
+        return
+
+    shard_dir = out_path.parent / "embed_ann_shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+
+    shard_paths = []
+
     for split in config.SPLITS:
         if not config.norm_path(split, config.SOURCE1_SRC, in_dir).exists():
             continue
-            
-        countries = pl.scan_parquet(config.records_path(split, config.SOURCE1_SRC, in_dir)).select(pl.col("country").unique()).collect()["country"].to_list()
-        for country in countries:
-            df = process_shard(split, country, in_dir, out_dir, model)
-            if df is not None:
-                all_pairs.append(df.with_columns(pl.lit(split).alias("split"), pl.lit(country).alias("country")))
 
-    if all_pairs:
-        final_df = pl.concat(all_pairs)
+        countries = (
+            pl.scan_parquet(config.records_path(split, config.SOURCE1_SRC, in_dir))
+            .select(pl.col("country").unique())
+            .collect()["country"]
+            .to_list()
+        )
+        for country in sorted(countries):
+            shard_file = shard_dir / f"embed_{split}_{country.replace(' ', '_')}.parquet"
+            shard_paths.append(shard_file)
+
+            if shard_file.exists():
+                rows = pl.scan_parquet(shard_file).select(pl.len()).collect().item()
+                print(f"[{split}/{country}] Already done ({rows:,} pairs) — skipping.")
+                continue
+
+            df = process_shard(split, country, in_dir, out_dir, model, out_path)
+            if df is not None:
+                df = df.with_columns(pl.lit(split).alias("split"), pl.lit(country).alias("country"))
+                df.write_parquet(shard_file)
+                print(f"  -> Wrote {df.height:,} pairs to {shard_file.name}")
+
+    # Merge all completed shards into the final parquet.
+    completed = [p for p in shard_paths if p.exists()]
+    if completed:
+        print(f"\nMerging {len(completed)} shard(s) into {out_path} ...")
+        final_df = pl.concat([pl.read_parquet(p) for p in completed])
         final_df.write_parquet(out_path)
-        print(f"\nSaved {final_df.height:,} total pairs to {out_path}")
+        print(f"Saved {final_df.height:,} total pairs to {out_path}")
+        # Clean up shard files to save disk space.
+        for p in completed:
+            p.unlink()
+        try:
+            shard_dir.rmdir()
+        except OSError:
+            pass
     else:
         print("\nNo data processed.")
+
 
 if __name__ == "__main__":
     sys.exit(main())

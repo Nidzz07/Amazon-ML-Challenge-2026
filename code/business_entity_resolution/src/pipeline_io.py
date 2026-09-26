@@ -93,6 +93,25 @@ def val_ids(smoke: bool) -> pl.Series | None:
     return pl.read_parquet(config.VAL_ENTITY_IDS)["entity_id"]
 
 
+def peak_rss_bytes() -> int | None:
+    """Peak resident set size of this process, or None when the platform can't report it."""
+    try:
+        import psutil
+
+        info = psutil.Process().memory_info()
+        return getattr(info, "peak_wset", None) or info.rss  # peak_wset is Windows-only
+    except ImportError:
+        pass
+    try:
+        import resource
+        import sys
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak if sys.platform == "darwin" else peak * 1024  # bytes on macOS, KiB on Linux
+    except ImportError:
+        return None
+
+
 def git_sha() -> str:
     try:
         return subprocess.run(
