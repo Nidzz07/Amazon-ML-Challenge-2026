@@ -24,6 +24,7 @@ NORM_SCHEMA = {
     "country": pl.String,
     "has_addr": pl.Boolean,
     "script": pl.UInt8,
+    # Legal suffix stripped from name_roman ("private limited", "llc", "sarl"); '' if none.
     "name_suffix": pl.String,
 }
 

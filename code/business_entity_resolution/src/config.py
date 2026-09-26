@@ -117,6 +117,9 @@ SMOKE_DISTRACTOR_RATIO = 0.35
 SMOKE_TEST_ENTITIES = 5_000
 SMOKE_TEST_MIN_PER_COUNTRY = 500  # every test country (France included) gets at least this many S1 rows
 
+# Normalisation (S1). Rows per slice; bounds peak memory on the 5M-row pool files.
+S1_CHUNK_ROWS = 1_000_000
+
 # Blocking.
 # Channel bit positions in candidates.channels (uint8 bitmask).
 CHANNELS = ("name_tfidf", "addr_tfidf", "exact_key", "rare_token", "embed_ann")
@@ -146,7 +149,15 @@ TFIDF_MIN_DF = 2
 TFIDF_MAX_DF = 20_000
 TFIDF_TOP_K = 20
 TFIDF_CHUNK_ROWS = 20_000
-EXACT_KEY_FAMILIES = (("street_num", "city_norm"), ("postcode", "street_num"), ("name_acronym", "city_norm"))
+# city_norm / state_canon are filled by normalise.parse_address_components. street_num
+# is the verbatim house-number token ("8-2-293/82/c/16/a"), so (street_num, state_canon)
+# is specific enough to key on; oversized buckets are dropped by EXACT_KEY_MAX_BUCKET.
+EXACT_KEY_FAMILIES = (
+    ("street_num", "city_norm"),
+    ("postcode", "street_num"),
+    ("name_acronym", "city_norm"),
+    ("street_num", "state_canon"),
+)
 RARE_TOKEN_DF_MIN = 2
 RARE_TOKEN_DF_MAX = 5_000
 RARE_TOKENS_PER_ENTITY = 3

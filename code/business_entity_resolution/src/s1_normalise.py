@@ -1,9 +1,9 @@
-"""S1 Normalise (STUB, owner: Parth): records_{split}_{src} -> norm_{split}_{src}.
+"""S1 Normalise (owner: Parth; taken over by Nidhi): records_{split}_{src} -> norm_{split}_{src}.
 
-Pass-through placeholder. It emits the norm schema with no real normalisation:
-lowercase and trimmed text, no transliteration (name_roman == name_norm), and
-word-regex tokens. Replace the body of normalise_frame(). The output columns and
-dtypes are fixed by PROJECT_ROADMAP.md.
+All text logic lives in normalise.py and translit.py. This stage only does I/O: it
+reads each records file in slices of config.S1_CHUNK_ROWS, normalises each slice, and
+streams it into the output Parquet. The output schema is fixed by PROJECT_ROADMAP.md.
+One translit.Romaniser (and so one token memo) is shared across every file in the run.
 
 Usage:
     python s1_normalise.py [--smoke] [--input DIR] [--output DIR]
@@ -12,57 +12,56 @@ import sys
 import time
 
 import polars as pl
+import pyarrow.parquet as pq
 
 import config
+import normalise
 import pipeline_io as pio
+import translit
 
-TOKEN_RE = r"\w+"  # Unicode-aware: keeps Devanagari/Tamil/etc. words intact
 
-
-def normalise_frame(lf: pl.LazyFrame) -> pl.LazyFrame:
-    name = pl.col("business_name").str.to_lowercase().str.strip_chars()
-    addr = pl.col("business_address").str.to_lowercase().str.strip_chars()
-    return (
-        lf.with_columns(name.alias("name_norm"), addr.alias("addr_norm"))
-        .with_columns(
-            pl.col("name_norm").str.extract_all(TOKEN_RE).alias("name_tokens"),
-            pl.col("addr_norm").str.extract_all(TOKEN_RE).alias("addr_tokens"),
-        )
-        .select(
-            "entity_id",
-            "name_norm",
-            pl.col("name_norm").alias("name_roman"),
-            "name_tokens",
-            pl.col("name_tokens").list.eval(pl.element().str.slice(0, 1)).list.join("").alias("name_acronym"),
-            "addr_norm",
-            pl.col("addr_norm").alias("addr_roman"),
-            "addr_tokens",
-            pl.col("addr_norm").str.extract(r"\b(\d+)\b", 1).fill_null("").alias("street_num"),
-            pl.lit("").alias("city_norm"),
-            pl.lit("").alias("state_canon"),
-            pl.col("addr_norm").str.extract(r"\b(\d{5,6})\b", 1).fill_null("").alias("postcode"),
-            "country",
-            (pl.col("addr_norm") != "").alias("has_addr"),
-            pl.lit(0, dtype=pl.UInt8).alias("script"),  # 0 = unknown until script detection lands
-            pl.lit("").alias("name_suffix"),
-        )
-    )
+def normalise_file(src_path, out_path, romaniser: translit.Romaniser) -> int:
+    records = pl.read_parquet(src_path)
+    writer, rows = None, 0
+    try:
+        for chunk in records.iter_slices(config.S1_CHUNK_ROWS):
+            out = normalise.normalise_frame(chunk, romaniser)
+            pio.check_schema(out, pio.NORM_SCHEMA, out_path.name)
+            table = out.to_arrow()
+            if writer is None:
+                writer = pq.ParquetWriter(out_path, table.schema)
+            writer.write_table(table)
+            rows += out.height
+        if writer is None:  # empty input still gets a schema-correct file
+            pl.DataFrame(schema=pio.NORM_SCHEMA).write_parquet(out_path)
+    finally:
+        if writer is not None:
+            writer.close()
+    assert rows == records.height, f"{out_path.name}: {rows} rows out, {records.height} in"
+    return rows
 
 
 def main(argv=None) -> None:
     args = pio.parser(__doc__).parse_args(argv)
     in_dir, out_dir = pio.dirs(args)
+    romaniser = translit.Romaniser()
     t0 = time.perf_counter()
+    total = 0
     for split, srcs in config.SPLITS.items():
         for src in srcs:
             if src == "ground_truth":
                 continue
             out = config.norm_path(split, src, out_dir)
-            normalise_frame(pl.scan_parquet(config.records_path(split, src, in_dir))).sink_parquet(out)
-            df = pl.read_parquet(out)
-            pio.check_schema(df, pio.NORM_SCHEMA, out.name)
-            print(f"{out.name:<32} {df.height:>10,}")
-    print(f"s1 done in {time.perf_counter() - t0:.1f}s")
+            t = time.perf_counter()
+            fields_before = romaniser.fields
+            rows = normalise_file(config.records_path(split, src, in_dir), out, romaniser)
+            total += rows
+            print(f"{out.name:<32} {rows:>10,} rows  {romaniser.fields - fields_before:>9,} Indic fields  "
+                  f"{time.perf_counter() - t:6.1f}s")
+    sec = time.perf_counter() - t0
+    print(f"romaniser: {romaniser.fields:,} fields, {romaniser.hits + romaniser.misses:,} run lookups, "
+          f"hit rate {romaniser.hit_rate:.4f}, {romaniser.cache_size:,} cached runs")
+    print(f"s1 done in {sec:.1f}s ({total:,} records, {total / sec if sec else 0:,.0f} records/s)")
 
 
 if __name__ == "__main__":
