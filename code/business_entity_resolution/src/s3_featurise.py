@@ -1,12 +1,11 @@
-"""S3 Featurise (STUB, owner: Krrish): norm + candidates_{split} -> features_{split}.
+"""S3 Featurise (owner: Krrish): norm + candidates_{split} → features_{split}.
 
-Placeholder. It emits the four stub features in pipeline_io.STUB_FEATURE_NAMES,
-taken straight from the candidate row, as f000..f003 float32. On train it adds a
-uint8 label from the ground truth. Once features.py defines FEATURE_NAMES /
-FEATURE_VERSION this stub refuses to run, because it cannot compute those; replace
-compute_features() at that point.
+Joins normalised Source-1 and Source-2/3 data onto candidate pairs, adds
+context and competition columns, then calls features.featurise() to produce
+the full feature matrix.
 
-Output: source1_entity_id, candidate_entity_id, f000..fNNN float32, [label uint8 on train].
+Output schema: source1_entity_id, candidate_entity_id, f000…fNNN float32,
+[label uint8 on train splits only].
 
 Usage:
     python s3_featurise.py [--smoke] [--input DIR] [--output DIR]
@@ -14,55 +13,177 @@ Usage:
 import sys
 import time
 
+import numpy as np
 import polars as pl
 
 import config
 import pipeline_io as pio
+from features import FEATURE_NAMES, FEATURE_VERSION, NUM_FEATURES, featurise
 
-STUB_EXPRS = {
-    "prior_score": pl.col("prior_score"),
-    "n_channels": pl.col("n_channels"),
-    "best_rank": pl.col("best_rank"),
-    "is_source3": pl.col("candidate_entity_id").str.starts_with("S3-"),
-}
+# ═══════════════════════════════════════════════════════════════════════
+# Data loading and joining
+# ═══════════════════════════════════════════════════════════════════════
+
+# Columns from the normalised schema that feed into features.
+# entity_id is used for the join key, country is not needed in features.
+_NORM_COLS = [
+    "entity_id", "name_norm", "name_roman", "name_tokens", "name_acronym",
+    "addr_norm", "addr_roman", "addr_tokens",
+    "street_num", "city_norm", "state_canon", "postcode",
+    "has_addr", "script", "name_suffix",
+]
 
 
-def true_pairs(in_dir) -> pl.LazyFrame:
+def _load_norm(split: str, src: str, in_dir) -> pl.DataFrame:
+    """Load normalised data, selecting only the columns we need.
+
+    Gracefully handles a missing name_suffix column (in case the normaliser
+    hasn't been updated yet) by filling it with empty strings.
+    """
+    path = config.norm_path(split, src, in_dir)
+    df = pl.read_parquet(path)
+    if "name_suffix" not in df.columns:
+        df = df.with_columns(pl.lit("").alias("name_suffix"))
+    available = [c for c in _NORM_COLS if c in df.columns]
+    return df.select(available)
+
+
+def _load_pool(split: str, in_dir) -> pl.DataFrame:
+    """Concatenate Source-2 and Source-3 normalised data."""
+    parts = [_load_norm(split, s, in_dir) for s in config.CANDIDATE_SRCS]
+    return pl.concat(parts)
+
+
+def _true_pairs(in_dir) -> pl.LazyFrame:
+    """Ground-truth as long (source1_entity_id, candidate_entity_id, label=1)."""
     return (
         pl.scan_parquet(config.records_path("train", "ground_truth", in_dir))
-        .select("source1_entity_id", pl.col("matched_entity_ids").str.split(",").alias("candidate_entity_id"))
+        .select(
+            "source1_entity_id",
+            pl.col("matched_entity_ids").str.split(",").alias("candidate_entity_id"),
+        )
         .explode("candidate_entity_id", empty_as_null=False)
         .filter(pl.col("candidate_entity_id") != "")
         .with_columns(pl.lit(1, dtype=pl.UInt8).alias("label"))
     )
 
 
-def compute_features(split: str, in_dir) -> pl.DataFrame:
-    names, _ = pio.feature_spec()
-    missing = [n for n in names if n not in STUB_EXPRS]
-    assert not missing, f"stub s3 cannot compute {missing}; replace this stub with the real featuriser"
+def _prefix_cols(df: pl.DataFrame, prefix: str) -> pl.DataFrame:
+    """Rename all columns (except entity_id) with a prefix."""
+    return df.rename(
+        {c: f"{prefix}_{c}" for c in df.columns if c != "entity_id"}
+    )
 
-    lf = pl.scan_parquet(config.candidates_path(split, in_dir))
-    cols = [STUB_EXPRS[n].cast(pl.Float32).alias(c) for n, c in zip(names, pio.feature_columns(len(names)))]
-    out = lf.select("source1_entity_id", "candidate_entity_id", *cols)
-    if split == "train":
-        out = out.join(true_pairs(in_dir), on=["source1_entity_id", "candidate_entity_id"], how="left").with_columns(
-            pl.col("label").fill_null(0)
+
+def _add_context_and_competition(cands: pl.DataFrame) -> pl.DataFrame:
+    """Add context features (entity-level) and competition features
+    (candidate-level) as new columns on the candidates DataFrame.
+
+    Context: entity_best_score, entity_n_cands
+    Competition: cand_best_score, cand_n_claims
+    Derived: is_source3
+    """
+    # Entity-level context
+    entity_ctx = cands.group_by("source1_entity_id").agg(
+        pl.col("prior_score").max().alias("entity_best_score"),
+        pl.len().cast(pl.Float32).alias("entity_n_cands"),
+    )
+
+    # Competition: for each candidate, its best score across all entities
+    cand_comp = cands.group_by("candidate_entity_id").agg(
+        pl.col("prior_score").max().alias("cand_best_score"),
+        pl.len().cast(pl.Float32).alias("cand_n_claims"),
+    )
+
+    return (
+        cands
+        .join(entity_ctx, on="source1_entity_id", how="left")
+        .join(cand_comp, on="candidate_entity_id", how="left")
+        .with_columns(
+            pl.col("candidate_entity_id").str.starts_with("S3-")
+            .cast(pl.Float32).alias("is_source3"),
         )
-    return out.collect()
+    )
+
+
+def build_pairs(split: str, in_dir) -> pl.DataFrame:
+    """Join candidates with normalised data from both sides and add
+    context/competition columns.  Returns the DataFrame ready for
+    features.featurise().
+    """
+    # Load data
+    s1_norm = _prefix_cols(_load_norm(split, config.SOURCE1_SRC, in_dir), "s1")
+    pool_norm = _prefix_cols(_load_pool(split, in_dir), "cand")
+    cands = pl.read_parquet(config.candidates_path(split, in_dir))
+
+    # Add context and competition features
+    cands = _add_context_and_competition(cands)
+
+    # Join Source-1 normalised data
+    pairs = cands.join(s1_norm, left_on="source1_entity_id", right_on="entity_id", how="left")
+
+    # Join candidate normalised data
+    pairs = pairs.join(pool_norm, left_on="candidate_entity_id", right_on="entity_id", how="left")
+
+    return pairs
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_features(split: str, in_dir) -> pl.DataFrame:
+    """Build the feature matrix for a split.
+
+    Returns a DataFrame with: source1_entity_id, candidate_entity_id,
+    f000…fNNN float32, [label uint8 on train].
+    """
+    pairs = build_pairs(split, in_dir)
+    n = pairs.height
+
+    print(f"  Computing {NUM_FEATURES} features for {n:,} pairs …")
+    t = time.perf_counter()
+    feat_arr = featurise(pairs)
+    print(f"  Features computed in {time.perf_counter() - t:.1f}s")
+
+    # Build output DataFrame
+    fcols = pio.feature_columns(NUM_FEATURES)
+    feat_df = pl.DataFrame(
+        {c: feat_arr[:, i] for i, c in enumerate(fcols)},
+        schema={c: pl.Float32 for c in fcols},
+    )
+    out = pl.concat(
+        [pairs.select("source1_entity_id", "candidate_entity_id"), feat_df],
+        how="horizontal",
+    )
+
+    if split == "train":
+        labels = _true_pairs(in_dir).collect()
+        out = out.join(
+            labels, on=["source1_entity_id", "candidate_entity_id"], how="left"
+        ).with_columns(pl.col("label").fill_null(0))
+
+    return out
 
 
 def main(argv=None) -> None:
     args = pio.parser(__doc__).parse_args(argv)
     in_dir, out_dir = pio.dirs(args)
     t0 = time.perf_counter()
+
+    print(f"Feature spec: {NUM_FEATURES} features, version {FEATURE_VERSION}")
+    print(f"  Names: {', '.join(FEATURE_NAMES[:5])} … {', '.join(FEATURE_NAMES[-3:])}")
+
     for split in config.SPLITS:
+        print(f"\n[{split}]")
         feats = compute_features(split, in_dir)
         out = config.features_path(split, out_dir)
         feats.write_parquet(out)
+        n_feat = feats.width - 2 - ("label" in feats.columns)
         pos = f", {int(feats['label'].sum()):,} positives" if "label" in feats.columns else ""
-        print(f"{out.name:<24} {feats.height:>10,} rows x {feats.width - 2 - ('label' in feats.columns)} features{pos}")
-    print(f"s3 done in {time.perf_counter() - t0:.1f}s")
+        print(f"  {out.name:<24} {feats.height:>10,} rows × {n_feat} features{pos}")
+
+    print(f"\ns3 done in {time.perf_counter() - t0:.1f}s")
 
 
 if __name__ == "__main__":

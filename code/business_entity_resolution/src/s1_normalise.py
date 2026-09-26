@@ -44,6 +44,7 @@ def normalise_frame(lf: pl.LazyFrame) -> pl.LazyFrame:
             "country",
             (pl.col("addr_norm") != "").alias("has_addr"),
             pl.lit(0, dtype=pl.UInt8).alias("script"),  # 0 = unknown until script detection lands
+            pl.lit("").alias("name_suffix"),
         )
     )
 
