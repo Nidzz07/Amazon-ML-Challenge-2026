@@ -41,13 +41,48 @@ def normalise_file(src_path, out_path, romaniser: translit.Romaniser) -> int:
     return rows
 
 
-def main(argv=None) -> None:
+def missing_inputs(in_dir) -> dict[str, list]:
+    """{split: [missing records_{split}_{src}.parquet paths]} for every split with a gap."""
+    gaps = {}
+    for split, srcs in config.SPLITS.items():
+        miss = [config.records_path(split, s, in_dir) for s in srcs
+                if s != "ground_truth" and not config.records_path(split, s, in_dir).exists()]
+        if miss:
+            gaps[split] = miss
+    return gaps
+
+
+def main(argv=None) -> int:
     args = pio.parser(__doc__).parse_args(argv)
     in_dir, out_dir = pio.dirs(args)
+
+    # Pre-flight, BEFORE anything is written. Without it s1 wrote all three norm_train_*
+    # files and then died inside polars on records_test_source1.parquet, leaving a
+    # directory where train looks finished and test is absent — and s2_block --splits
+    # train runs happily on that. Same rule as s3_featurise: a split with SOME inputs
+    # missing is an error; a split with ALL of them missing is skipped, loudly.
+    gaps = missing_inputs(in_dir)
+    n_srcs = {sp: sum(s != "ground_truth" for s in srcs) for sp, srcs in config.SPLITS.items()}
+    partial = {sp: m for sp, m in gaps.items() if len(m) < n_srcs[sp]}
+    if partial:
+        lines = "\n".join(f"    {p}" for m in partial.values() for p in m)
+        raise SystemExit(
+            f"s1_normalise: split(s) {', '.join(partial)} partially ingested — these records files "
+            f"are missing:\n{lines}\n  Re-run s0_ingest{' --smoke' if args.smoke else ''} first. "
+            f"Nothing was written."
+        )
+    skip = set(gaps)
+    if skip == set(config.SPLITS):
+        raise SystemExit(f"s1_normalise: no records_*.parquet in {in_dir} — run s0_ingest first. Nothing was written.")
+    for sp in sorted(skip):
+        print(f"SKIPPING {sp}: none of its records files exist in {in_dir} — norm_{sp}_* will NOT be written.")
+
     romaniser = translit.Romaniser()
     t0 = time.perf_counter()
     total = 0
     for split, srcs in config.SPLITS.items():
+        if split in skip:
+            continue
         for src in srcs:
             if src == "ground_truth":
                 continue
@@ -62,6 +97,11 @@ def main(argv=None) -> None:
     print(f"romaniser: {romaniser.fields:,} fields, {romaniser.hits + romaniser.misses:,} run lookups, "
           f"hit rate {romaniser.hit_rate:.4f}, {romaniser.cache_size:,} cached runs")
     print(f"s1 done in {sec:.1f}s ({total:,} records, {total / sec if sec else 0:,.0f} records/s)")
+    if skip:
+        print(f"INCOMPLETE — split(s) {', '.join(sorted(skip))} skipped (see above). Exiting 1 so a "
+              f"chained `s1 && s2` stops here.")
+        return 1
+    return 0
 
 
 if __name__ == "__main__":

@@ -121,6 +121,21 @@ def main(argv=None) -> None:
     print_summary(results)
     print(f"\ntotal {time.perf_counter() - t0:.1f}s -> {artifacts_dir}")
 
+    # run() skips a missing raw file in smoke mode (full mode raises instead). A skipped
+    # file used to scroll away above the summary while s0 still exited 0, so `s0 && s1`
+    # carried on and s1 then died half-way. Name every gap here, and fail the exit code.
+    done = {(r["split"], r["src"]) for r in results}
+    skipped = [(sp, src) for sp, srcs in config.SPLITS.items() for src in srcs if (sp, src) not in done]
+    if skipped:
+        splits = sorted({sp for sp, _ in skipped})
+        print(f"\nINCOMPLETE — {len(skipped)} raw file(s) not found, so split(s) {', '.join(splits)} "
+              f"were not (fully) ingested:")
+        for sp, src in skipped:
+            print(f"    {sp:<6}{src:<14}{raw_path_fn(sp, src, dataset_dir)}")
+        print("  Every later stage needs both splits. Exiting 1 so a chained `s0 && s1` stops here.")
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())

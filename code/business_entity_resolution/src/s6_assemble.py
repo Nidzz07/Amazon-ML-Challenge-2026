@@ -24,6 +24,7 @@ import polars as pl
 import assemble
 import config
 import pipeline_io as pio
+import validate_submission_native
 
 
 def main(argv=None) -> None:
@@ -48,6 +49,8 @@ def main(argv=None) -> None:
         cand_path, match_path = config.candidate_pairs_path(split, dest), config.matching_results_path(split, dest)
         pio.write_id_lists(s1_ids, cands, "candidate_entity_ids", cand_path)
         pio.write_id_lists(s1_ids, matches, "matched_entity_ids", match_path)
+        if split == "test":  # the only split that is ever a submission; a failure quarantines it
+            validate_submission_native.gate(match_path, cand_path, smoke=args.smoke, quarantine=True)
 
         n = len(s1_ids)
         no_cands = n - decisions.height
