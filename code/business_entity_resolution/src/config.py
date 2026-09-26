@@ -135,6 +135,16 @@ S1_CHUNK_ROWS = 1_000_000
 #                       >= S3_CHUNK_ROWS and is clamped up if it is not.
 S3_CHUNK_ROWS = 10_000
 S3_JOIN_BLOCK_ROWS = 250_000
+# Entity-level subsample of the TRAIN split only, applied before featurising.
+# Train is 2,206,821 entities x MAX_CANDIDATES_PER_ENTITY ~= 66M pairs, larger than
+# the whole test set, and s4 throws most of it away anyway (all positives + hard
+# negatives at NEG_TO_POS_RATIO). 300k entities is ~9M pairs and still ~1.04M
+# positives. The TEST split is NEVER subsampled - every one of its 1,732,544
+# entities must be scored. 0 or None means "featurise every train entity"
+# (s3_featurise --no-train-subsample).
+# The sample is stratified by country and drawn from the sorted id list under SEED,
+# so it is reproducible and preserves the country mix and the positive rate.
+S3_TRAIN_ENTITIES = 300_000
 
 # Blocking.
 # Channel bit positions in candidates.channels (uint8 bitmask).

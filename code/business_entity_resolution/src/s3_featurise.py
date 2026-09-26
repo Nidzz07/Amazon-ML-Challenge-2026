@@ -41,6 +41,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import pyarrow.parquet as pq
 
@@ -137,38 +138,83 @@ def _prefix_cols(df: pl.DataFrame, prefix: str) -> pl.DataFrame:
     )
 
 
-def _add_context_and_competition(cands: pl.DataFrame) -> pl.DataFrame:
-    """Add context features (entity-level) and competition features
-    (candidate-level) as new columns on the candidates DataFrame.
+def shard_candidates(split: str, in_dir, all_ids: pl.Series, keep_ids: pl.Series | None = None) -> pl.DataFrame:
+    """One country shard's candidate pairs, carrying the context and competition
+    columns that features.featurise() reads.
 
-    Context: entity_best_score, entity_n_cands
-    Competition: cand_best_score, cand_n_claims
-    Derived: is_source3
+    Context (entity-level):     entity_best_score, entity_n_cands
+    Competition (cand-level):   cand_best_score, cand_n_claims
+    Derived:                    is_source3
 
-    Called once per country shard, before chunking, so every aggregate covers
-    the entity's / candidate's complete set of rows.
+    `all_ids` is every Source-1 entity in the shard; `keep_ids` is the subset whose
+    rows we actually want (train subsampling — None keeps everything).
+
+    The competition aggregates are deliberately computed over ALL of the shard's
+    entities and only then narrowed to keep_ids, because "how many entities claimed
+    this candidate" and "its best score across them" must mean the same thing in
+    training as at inference, where every entity is present. Aggregating after the
+    narrowing would divide cand_n_claims by the subsample rate and inflate
+    cand_is_argmax. The entity-level aggregates are per-entity, so narrowing first
+    or last gives the same values.
     """
-    # Entity-level context
-    entity_ctx = cands.group_by("source1_entity_id").agg(
-        pl.col("prior_score").max().alias("entity_best_score"),
-        pl.len().cast(pl.Float32).alias("entity_n_cands"),
+    lf = pl.scan_parquet(config.candidates_path(split, in_dir)).filter(
+        pl.col("source1_entity_id").is_in(all_ids.implode())
     )
-
-    # Competition: for each candidate, its best score across all entities
-    cand_comp = cands.group_by("candidate_entity_id").agg(
+    # Built on the pre-narrowing plan; LazyFrames are immutable, so the rebinding
+    # of `lf` below does not reach back into this aggregation.
+    cand_comp = lf.group_by("candidate_entity_id").agg(
         pl.col("prior_score").max().alias("cand_best_score"),
         pl.len().cast(pl.Float32).alias("cand_n_claims"),
     )
-
+    if keep_ids is not None:
+        lf = lf.filter(pl.col("source1_entity_id").is_in(keep_ids.implode()))
+    entity_ctx = lf.group_by("source1_entity_id").agg(
+        pl.col("prior_score").max().alias("entity_best_score"),
+        pl.len().cast(pl.Float32).alias("entity_n_cands"),
+    )
     return (
-        cands
-        .join(entity_ctx, on="source1_entity_id", how="left")
+        lf.join(entity_ctx, on="source1_entity_id", how="left")
         .join(cand_comp, on="candidate_entity_id", how="left")
         .with_columns(
             pl.col("candidate_entity_id").str.starts_with("S3-")
             .cast(pl.Float32).alias("is_source3"),
         )
+        .collect(engine="streaming")
     )
+
+
+def sample_train_entities(split: str, in_dir, n: int | None, seed: int = config.SEED) -> pl.Series | None:
+    """`n` Source-1 entity ids stratified by country, or None to keep every entity.
+
+    Quotas are largest-remainder over the country counts, so the sampled country mix
+    matches the full split's and the totals add up exactly. Ids are sorted before
+    the draw, so the sample depends only on the seed and the id set and never on
+    parquet row order (the discipline validation_split.py uses).
+    """
+    assert split == "train", f"only the train split may be subsampled, not {split!r}"
+    lf = pl.scan_parquet(config.norm_path(split, config.SOURCE1_SRC, in_dir))
+    have = lf.collect_schema().names()
+    ids = lf.select(["entity_id"] + (["country"] if "country" in have else [])).collect()
+    if not n or n <= 0 or n >= ids.height:
+        return None
+    if "country" not in ids.columns:
+        ids = ids.with_columns(pl.lit("").alias("country"))
+
+    counts = ids.group_by("country").len().sort("country")
+    total = int(counts["len"].sum())
+    exact = [(c, int(ln) * n / total) for c, ln in zip(counts["country"], counts["len"])]
+    quota = {c: int(v) for c, v in exact}
+    for c, _ in sorted(exact, key=lambda t: int(t[1]) - t[1])[: n - sum(quota.values())]:
+        quota[c] += 1
+
+    rng = np.random.default_rng(seed)
+    parts = []
+    for c, ln in zip(counts["country"], counts["len"]):
+        cid = ids.filter(pl.col("country") == c)["entity_id"].sort()
+        k = min(quota[c], len(cid))
+        if k:
+            parts.append(cid.gather(np.sort(rng.choice(len(cid), size=k, replace=False))))
+    return pl.concat(parts) if parts else None
 
 
 def _load_embed_scores(split: str, in_dir) -> pl.DataFrame | None:
@@ -248,11 +294,16 @@ def featurise_split(
     out_dir,
     chunk_rows: int = None,
     block_rows: int = None,
+    train_entities: int | None = None,
     verbose: bool = True,
 ) -> dict:
     """Shard `split` by country, chunk within country, stream to features_{split}.
 
-    Returns {rows, positives, sec, peak_rss_mb}.
+    `train_entities` subsamples the train split to that many Source-1 entities
+    (None/0 = all). It is ignored for every other split: test is always featurised
+    in full, because every test entity needs a prediction.
+
+    Returns {rows, entities, positives, sec, peak_rss_mb}.
     """
     chunk_rows = chunk_rows or config.S3_CHUNK_ROWS
     block_rows = max(block_rows or config.S3_JOIN_BLOCK_ROWS, chunk_rows)
@@ -260,32 +311,41 @@ def featurise_split(
     schema = out_schema(split)
     out_path = config.features_path(split, out_dir)
 
+    keep = sample_train_entities(split, in_dir, train_entities) if split == "train" else None
+
     embed_all = _load_embed_scores(split, in_dir)
     labels_all = _true_pairs(in_dir).collect() if split == "train" else None
     if verbose:
         print(f"  embed_ann: {'joined from embed_ann_pairs.parquet' if embed_all is not None else 'no precomputed scores found, embed_cosine/rank = 0'}")
+        if split != "train":
+            print("  entities: ALL (test is never subsampled)")
+        elif keep is None:
+            print("  entities: ALL train entities (no subsample)")
+        else:
+            print(f"  entities: {len(keep):,} sampled, stratified by country, seed {config.SEED}")
 
     t0 = time.perf_counter()
-    rows = positives = 0
+    rows = positives = entities = 0
     peak = _rss_mb()
     writer = None
     try:
         for country in shard_countries(split, in_dir):
             ts = time.perf_counter()
-            s1_norm = _prefix_cols(_load_norm(split, config.SOURCE1_SRC, in_dir, country), "s1")
+            s1_all = _load_norm(split, config.SOURCE1_SRC, in_dir, country)
+            all_ids = s1_all["entity_id"]
+            if keep is not None:
+                s1_all = s1_all.filter(pl.col("entity_id").is_in(keep.implode()))
+            s1_ids = s1_all["entity_id"]
+            s1_norm = _prefix_cols(s1_all, "s1")
+            del s1_all
             pool_norm = _prefix_cols(_load_pool(split, in_dir, country), "cand")
-            s1_ids = s1_norm["entity_id"]
 
-            cands = (
-                pl.scan_parquet(config.candidates_path(split, in_dir))
-                .filter(pl.col("source1_entity_id").is_in(s1_ids.implode()))
-                .collect(engine="streaming")
-            )
+            cands = shard_candidates(split, in_dir, all_ids, s1_ids if keep is not None else None)
             if cands.is_empty():
                 if verbose:
                     print(f"  [{split}/{country}] 0 candidate pairs — skipped")
                 continue
-            cands = _add_context_and_competition(cands)
+            entities += len(s1_ids)
 
             # Restrict the two pair-keyed side tables to this shard, so the
             # per-block joins never probe the other countries' rows.
@@ -320,8 +380,8 @@ def featurise_split(
             positives += shard_pos
             if verbose:
                 sec = time.perf_counter() - ts
-                print(f"  [{split}/{country}] {shard_rows:>12,} pairs  {sec:7.1f}s  "
-                      f"{shard_rows / max(sec, 1e-9):>9,.0f} rows/s"
+                print(f"  [{split}/{country}] {len(s1_ids):>9,} entities  {shard_rows:>12,} pairs  "
+                      f"{sec:7.1f}s  {shard_rows / max(sec, 1e-9):>9,.0f} rows/s"
                       + (f"  {shard_pos:>9,} positives" if split == "train" else ""))
 
         if writer is None:  # no shard produced a row: still emit a schema-correct file
@@ -330,7 +390,8 @@ def featurise_split(
         if writer is not None:
             writer.close()
 
-    return {"rows": rows, "positives": positives, "sec": time.perf_counter() - t0, "peak_rss_mb": peak}
+    return {"rows": rows, "entities": entities, "positives": positives,
+            "sec": time.perf_counter() - t0, "peak_rss_mb": peak}
 
 
 def main(argv=None) -> None:
@@ -341,6 +402,12 @@ def main(argv=None) -> None:
                     help=f"pairs per norm-join block (default {config.S3_JOIN_BLOCK_ROWS:,})")
     ap.add_argument("--splits", nargs="+", default=list(config.SPLITS),
                     help="only featurise these splits")
+    ap.add_argument("--train-entities", type=int, default=config.S3_TRAIN_ENTITIES,
+                    help=f"subsample the TRAIN split to this many Source-1 entities, "
+                         f"stratified by country (default {config.S3_TRAIN_ENTITIES:,}; "
+                         f"0 = all). Never applies to test.")
+    ap.add_argument("--no-train-subsample", action="store_true",
+                    help="featurise every train entity (same as --train-entities 0)")
     args = ap.parse_args(argv)
     in_dir, out_dir = pio.dirs(args)
     t0 = time.perf_counter()
@@ -348,6 +415,9 @@ def main(argv=None) -> None:
     print(f"Feature spec: {NUM_FEATURES} features, version {FEATURE_VERSION}")
     print(f"  Names: {', '.join(FEATURE_NAMES[:5])} … {', '.join(FEATURE_NAMES[-3:])}")
     print(f"  Shards: by country; blocks of {args.block_rows:,} pairs, chunks of {args.chunk_rows:,}")
+    train_entities = 0 if args.no_train_subsample else args.train_entities
+    print(f"  Train subsample: {f'{train_entities:,} entities' if train_entities else 'OFF (all entities)'}"
+          f"  |  Test: always all entities")
 
     ran = []
     for split in args.splits:
@@ -370,11 +440,17 @@ def main(argv=None) -> None:
             )
 
         print(f"\n[{split}]")
-        st = featurise_split(split, in_dir, out_dir, args.chunk_rows, args.block_rows)
+        st = featurise_split(split, in_dir, out_dir, args.chunk_rows, args.block_rows, train_entities)
         ran.append(split)
         out = config.features_path(split, out_dir)
         pos = f", {st['positives']:,} positives" if split == "train" else ""
         print(f"  {out.name:<24} {st['rows']:>12,} rows × {NUM_FEATURES} features{pos}")
+        print(f"  {st['entities']:,} entities, {st['rows'] / max(st['entities'], 1):.2f} pairs/entity")
+        if split == "train":
+            neg = st["rows"] - st["positives"]
+            print(f"  positives {st['positives']:,} | negatives {neg:,} | "
+                  f"neg:pos {neg / max(st['positives'], 1):.2f}:1 | "
+                  f"positive rate {st['positives'] / max(st['rows'], 1):.4f}")
         per_m = st["rows"] / 1e6
         print(f"  {st['sec']:.1f}s  {st['rows'] / max(st['sec'], 1e-9):,.0f} rows/s"
               + (f"  peak RSS {st['peak_rss_mb']:,.0f} MB"
