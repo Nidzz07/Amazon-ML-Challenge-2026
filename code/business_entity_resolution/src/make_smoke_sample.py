@@ -103,7 +103,20 @@ def allocate(counts: dict[str, int], total: int, floor: int) -> dict[str, int]:
     return alloc
 
 
-def make_test(rng: np.random.Generator) -> dict[str, pl.DataFrame]:
+def make_test(rng: np.random.Generator) -> dict[str, pl.DataFrame] | None:
+    """Returns None (with a warning) when test_source2/3 parquets are missing.
+    This lets the script generate a train-only smoke so pipeline stubs can still
+    be validated end-to-end before the full test pool is downloaded.
+    """
+    missing = [
+        src for src in config.CANDIDATE_SRCS
+        if not config.records_path("test", src).exists()
+    ]
+    if missing:
+        print(f"WARNING: test smoke skipped — missing parquets for {missing}.")
+        print("         Download test_source2.tsv / test_source3.tsv and re-run to generate it.")
+        return None
+
     s1 = read("test", "source1")
     pools = {src: read("test", src) for src in config.CANDIDATE_SRCS}
 
@@ -143,12 +156,19 @@ def country_breakdown(split: str, frames: dict[str, pl.DataFrame]) -> pl.DataFra
 def main() -> None:
     t0 = time.perf_counter()
     rng = np.random.default_rng(config.SEED)
-    smoke = {"train": make_train(rng), "test": make_test(rng)}
+    train_smoke = make_train(rng)
+    test_smoke = make_test(rng)   # may return None if test pool not downloaded yet
+
+    smoke = {"train": train_smoke}
+    if test_smoke is not None:
+        smoke["test"] = test_smoke
 
     print()
     print(f"{'file':<32} {'rows':>10}")
     for split, frames in smoke.items():
         for src in config.SPLITS[split]:
+            if src not in frames:
+                continue
             path = config.smoke_raw_path(split, src)
             write_tsv(frames[src], path)
             verify_roundtrip(frames[src], path)
@@ -160,7 +180,8 @@ def main() -> None:
     print("\ncountry breakdown:")
     with pl.Config(tbl_hide_dataframe_shape=True, tbl_hide_column_data_types=True):
         print(country_breakdown("train", smoke["train"]))
-        print(country_breakdown("test", smoke["test"]))
+        if test_smoke is not None:
+            print(country_breakdown("test", smoke["test"]))
     print(f"\nwrote {config.SMOKE_DIR} in {time.perf_counter() - t0:.1f}s")
 
 

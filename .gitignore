@@ -1,5 +1,6 @@
 venv/
 data/
+datasets/
 artifacts/
 output/
 *.parquet
