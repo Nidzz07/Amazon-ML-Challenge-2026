@@ -133,9 +133,9 @@ def main(argv=None) -> None:
         in_df = pl.concat([in_pos, in_neg])
         
         try:
-            from features import FEATURE_MONOTONES
-            mono = FEATURE_MONOTONES
-        except ImportError:
+            from features import FEATURE_MONO
+            mono = list(FEATURE_MONO)
+        except (ImportError, AttributeError):
             mono = [0] * len(feature_cols)
         params = {**LGB_PARAMS, "monotone_constraints": mono}
         
@@ -178,11 +178,10 @@ def main(argv=None) -> None:
 
     # ── 5. Build LightGBM datasets ────────────────────────────────────────
     # Monotonic constraints: +1 for similarity/channel features, 0 for unconstrained.
-    # When Krrish's features.py exposes monotone directions, read them here.
     try:
-        from features import FEATURE_MONOTONES
-        mono = FEATURE_MONOTONES
-    except ImportError:
+        from features import FEATURE_MONO
+        mono = list(FEATURE_MONO)
+    except (ImportError, AttributeError):
         mono = [0] * len(feature_cols)
 
     params = {**LGB_PARAMS, "monotone_constraints": mono}
