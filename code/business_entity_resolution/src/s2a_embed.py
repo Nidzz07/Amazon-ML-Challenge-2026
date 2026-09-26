@@ -24,9 +24,9 @@ import pipeline_io as pio
 MODEL_NAME = "intfloat/multilingual-e5-base"
 BATCH_SIZE = 512
 MAX_SEQ_LEN = 64      # names/addresses are short; 512 (the default) wastes T4 time
-CHUNK = 250_000       # texts per resumable embedding chunk
-POOL_CHUNK = 400_000  # pool rows streamed through the GPU per search step
+CHUNK = 250_000       # texts per resumable embedding chunk (also the pool slice searched per step)
 QUERY_BATCH = 2048
+EMBED_DIM = 768
 
 def _get_texts(records_lf: pl.LazyFrame, norm_lf: pl.LazyFrame) -> pl.DataFrame:
     # Join records (for raw text) and norm (for romanized text)
@@ -46,43 +46,50 @@ def _get_texts(records_lf: pl.LazyFrame, norm_lf: pl.LazyFrame) -> pl.DataFrame:
     ])
     return df
 
-def embed_in_batches(model, texts: list[str], checkpoint_prefix: str) -> np.ndarray:
-    """L2-normalised fp16 embeddings, computed in resumable chunks (one .npy per chunk)."""
-    parts = []
+def embed_texts(model, texts: list[str], checkpoint_prefix: str) -> np.ndarray:
+    """L2-normalised fp16 embeddings, resumable in CHUNK-sized .npy files; preallocated so peak RAM = result size."""
+    out = np.empty((len(texts), EMBED_DIM), dtype=np.float16)
     for ci, start in enumerate(range(0, len(texts), CHUNK)):
-        path = Path(f"{checkpoint_prefix}_{ci:04d}.npy")
-        if path.exists():
-            parts.append(np.load(path))
-            continue
-        emb = model.encode(texts[start:start + CHUNK], batch_size=BATCH_SIZE, normalize_embeddings=True,
-                           convert_to_numpy=True, show_progress_bar=False).astype(np.float16)
-        np.save(path, emb)
-        parts.append(emb)
-        print(f"      [chunk {ci}] {min(start + CHUNK, len(texts)):,}/{len(texts):,}", flush=True)
-    return np.concatenate(parts)
+        out[start:start + CHUNK] = embed_chunk(model, texts[start:start + CHUNK], f"{checkpoint_prefix}_{ci:04d}.npy")
+    return out
 
 
-def gpu_topk(q_name, q_addr, p_name, p_addr, k: int, device: str):
-    """Exact top-k by (cos_name + cos_addr) / 2, the same ranking as cosine on the normalised concat.
-    Pool is streamed through the GPU in POOL_CHUNK slices; only (n_queries x k) state is kept."""
-    qn, qa = torch.from_numpy(q_name).to(device), torch.from_numpy(q_addr).to(device)
-    n_q = qn.shape[0]
-    best_s = torch.full((n_q, k), -1e9, dtype=torch.float32, device=device)
-    best_i = torch.zeros((n_q, k), dtype=torch.int64, device=device)
-    for ps in range(0, p_name.shape[0], POOL_CHUNK):
-        pn = torch.from_numpy(p_name[ps:ps + POOL_CHUNK]).to(device)
-        pa = torch.from_numpy(p_addr[ps:ps + POOL_CHUNK]).to(device)
-        kk = min(k, pn.shape[0])
-        for qs in range(0, n_q, QUERY_BATCH):
-            sim = (qn[qs:qs + QUERY_BATCH] @ pn.T + qa[qs:qs + QUERY_BATCH] @ pa.T).float() / 2
+def embed_chunk(model, texts: list[str], path: str) -> np.ndarray:
+    if Path(path).exists():
+        return np.load(path)
+    emb = model.encode(texts, batch_size=BATCH_SIZE, normalize_embeddings=True,
+                       convert_to_numpy=True, show_progress_bar=False).astype(np.float16)
+    np.save(path, emb)
+    print(f"      [saved] {Path(path).name}", flush=True)
+    return emb
+
+
+class TopK:
+    """Exact top-k by (cos_name + cos_addr) / 2 -- the same ranking as cosine on the normalised concat.
+    Queries live on the GPU; pool slices are fed in one at a time, so the pool never sits in RAM."""
+
+    def __init__(self, q_name: np.ndarray, q_addr: np.ndarray, k: int, device: str):
+        self.k, self.device = k, device
+        self.qn, self.qa = torch.from_numpy(q_name).to(device), torch.from_numpy(q_addr).to(device)
+        n_q = self.qn.shape[0]
+        self.best_s = torch.full((n_q, k), -1e9, dtype=torch.float32, device=device)
+        self.best_i = torch.zeros((n_q, k), dtype=torch.int64, device=device)
+
+    def update(self, p_name: np.ndarray, p_addr: np.ndarray, offset: int) -> None:
+        pn = torch.from_numpy(p_name).to(self.device)
+        pa = torch.from_numpy(p_addr).to(self.device)
+        kk = min(self.k, pn.shape[0])
+        for qs in range(0, self.qn.shape[0], QUERY_BATCH):
+            sim = (self.qn[qs:qs + QUERY_BATCH] @ pn.T + self.qa[qs:qs + QUERY_BATCH] @ pa.T).float() / 2
             s, i = sim.topk(kk, dim=1)
-            cs = torch.cat([best_s[qs:qs + QUERY_BATCH], s], dim=1)
-            ci = torch.cat([best_i[qs:qs + QUERY_BATCH], i + ps], dim=1)
-            top_s, pos = cs.topk(k, dim=1)
-            best_s[qs:qs + QUERY_BATCH] = top_s
-            best_i[qs:qs + QUERY_BATCH] = ci.gather(1, pos)
-        del pn, pa
-    return best_s.cpu().numpy(), best_i.cpu().numpy()
+            cs = torch.cat([self.best_s[qs:qs + QUERY_BATCH], s], dim=1)
+            ci = torch.cat([self.best_i[qs:qs + QUERY_BATCH], i + offset], dim=1)
+            top_s, pos = cs.topk(self.k, dim=1)
+            self.best_s[qs:qs + QUERY_BATCH] = top_s
+            self.best_i[qs:qs + QUERY_BATCH] = ci.gather(1, pos)
+
+    def result(self):
+        return self.best_s.cpu().numpy(), self.best_i.cpu().numpy()
 
 
 def process_shard(split: str, country: str, in_dir: Path, out_dir: Path, model, base_out_path: Path):
@@ -103,19 +110,26 @@ def process_shard(split: str, country: str, in_dir: Path, out_dir: Path, model, 
 
     chkpt_base = str(base_out_path.parent / f"embed_{split}_{country.replace(' ', '_')}")
 
-    # Names and addresses stay separate (fp16, normalised); the search sums the two cosines.
-    print("  Embedding Pool (Names)...", flush=True)
-    p_name = embed_in_batches(model, pool_df["name_text"].to_list(), f"{chkpt_base}_pool_name")
-    print("  Embedding Pool (Addresses)...", flush=True)
-    p_addr = embed_in_batches(model, pool_df["addr_text"].to_list(), f"{chkpt_base}_pool_addr")
-    print("  Embedding Source 1 (Names)...", flush=True)
-    q_name = embed_in_batches(model, s1_df["name_text"].to_list(), f"{chkpt_base}_s1_name")
-    print("  Embedding Source 1 (Addresses)...", flush=True)
-    q_addr = embed_in_batches(model, s1_df["addr_text"].to_list(), f"{chkpt_base}_s1_addr")
-
-    print("  Searching (GPU, chunked exact top-k)...", flush=True)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    scores, indices = gpu_topk(q_name, q_addr, p_name, p_addr, config.EMBED_TOP_K, device)
+    # Source 1 first (kept on the GPU), then the pool streams through chunk by chunk.
+    print("  Embedding Source 1 (Names)...", flush=True)
+    q_name = embed_texts(model, s1_df["name_text"].to_list(), f"{chkpt_base}_s1_name")
+    print("  Embedding Source 1 (Addresses)...", flush=True)
+    q_addr = embed_texts(model, s1_df["addr_text"].to_list(), f"{chkpt_base}_s1_addr")
+    topk = TopK(q_name, q_addr, config.EMBED_TOP_K, device)
+    del q_name, q_addr
+    gc.collect()
+
+    print("  Embedding Pool + searching (chunked)...", flush=True)
+    n_pool = pool_df.height
+    for ci, start in enumerate(range(0, n_pool, CHUNK)):
+        names = pool_df["name_text"].slice(start, CHUNK).to_list()
+        addrs = pool_df["addr_text"].slice(start, CHUNK).to_list()
+        pn = embed_chunk(model, names, f"{chkpt_base}_pool_name_{ci:04d}.npy")
+        pa = embed_chunk(model, addrs, f"{chkpt_base}_pool_addr_{ci:04d}.npy")
+        topk.update(pn, pa, start)
+        print(f"      pool {min(start + CHUNK, n_pool):,}/{n_pool:,}  ({time.perf_counter() - t0:.0f}s)", flush=True)
+    scores, indices = topk.result()
 
     s1_ids = s1_df["entity_id"].to_numpy()
     pool_ids = pool_df["entity_id"].to_numpy()
