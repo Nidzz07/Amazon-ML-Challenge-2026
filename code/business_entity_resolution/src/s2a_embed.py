@@ -16,15 +16,17 @@ import os
 import numpy as np
 import polars as pl
 import torch
-import faiss
 from sentence_transformers import SentenceTransformer
 
 import config
 import pipeline_io as pio
 
 MODEL_NAME = "intfloat/multilingual-e5-base"
-BATCH_SIZE = 256
-CHECKPOINT_EVERY = 500_000
+BATCH_SIZE = 512
+MAX_SEQ_LEN = 64      # names/addresses are short; 512 (the default) wastes T4 time
+CHUNK = 250_000       # texts per resumable embedding chunk
+POOL_CHUNK = 400_000  # pool rows streamed through the GPU per search step
+QUERY_BATCH = 2048
 
 def _get_texts(records_lf: pl.LazyFrame, norm_lf: pl.LazyFrame) -> pl.DataFrame:
     # Join records (for raw text) and norm (for romanized text)
@@ -44,93 +46,90 @@ def _get_texts(records_lf: pl.LazyFrame, norm_lf: pl.LazyFrame) -> pl.DataFrame:
     ])
     return df
 
-def embed_in_batches(model, texts: list[str], batch_size: int = BATCH_SIZE, checkpoint_prefix: str = None) -> np.ndarray:
-    embeddings = []
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i+batch_size]
-        emb = model.encode(batch, batch_size=batch_size, normalize_embeddings=False, convert_to_numpy=True, show_progress_bar=False)
-        embeddings.append(emb)
-        
-        # Checkpointing
-        rows_processed = i + len(batch)
-        if checkpoint_prefix and rows_processed % CHECKPOINT_EVERY < batch_size and rows_processed >= CHECKPOINT_EVERY:
-            current_emb = np.vstack(embeddings)
-            checkpoint_path = f"{checkpoint_prefix}_chkpt_{rows_processed}.npy"
-            np.save(checkpoint_path, current_emb)
-            print(f"      [Checkpoint] Saved {rows_processed} rows to {checkpoint_path}")
-            
-    return np.vstack(embeddings)
+def embed_in_batches(model, texts: list[str], checkpoint_prefix: str) -> np.ndarray:
+    """L2-normalised fp16 embeddings, computed in resumable chunks (one .npy per chunk)."""
+    parts = []
+    for ci, start in enumerate(range(0, len(texts), CHUNK)):
+        path = Path(f"{checkpoint_prefix}_{ci:04d}.npy")
+        if path.exists():
+            parts.append(np.load(path))
+            continue
+        emb = model.encode(texts[start:start + CHUNK], batch_size=BATCH_SIZE, normalize_embeddings=True,
+                           convert_to_numpy=True, show_progress_bar=False).astype(np.float16)
+        np.save(path, emb)
+        parts.append(emb)
+        print(f"      [chunk {ci}] {min(start + CHUNK, len(texts)):,}/{len(texts):,}", flush=True)
+    return np.concatenate(parts)
+
+
+def gpu_topk(q_name, q_addr, p_name, p_addr, k: int, device: str):
+    """Exact top-k by (cos_name + cos_addr) / 2, the same ranking as cosine on the normalised concat.
+    Pool is streamed through the GPU in POOL_CHUNK slices; only (n_queries x k) state is kept."""
+    qn, qa = torch.from_numpy(q_name).to(device), torch.from_numpy(q_addr).to(device)
+    n_q = qn.shape[0]
+    best_s = torch.full((n_q, k), -1e9, dtype=torch.float32, device=device)
+    best_i = torch.zeros((n_q, k), dtype=torch.int64, device=device)
+    for ps in range(0, p_name.shape[0], POOL_CHUNK):
+        pn = torch.from_numpy(p_name[ps:ps + POOL_CHUNK]).to(device)
+        pa = torch.from_numpy(p_addr[ps:ps + POOL_CHUNK]).to(device)
+        kk = min(k, pn.shape[0])
+        for qs in range(0, n_q, QUERY_BATCH):
+            sim = (qn[qs:qs + QUERY_BATCH] @ pn.T + qa[qs:qs + QUERY_BATCH] @ pa.T).float() / 2
+            s, i = sim.topk(kk, dim=1)
+            cs = torch.cat([best_s[qs:qs + QUERY_BATCH], s], dim=1)
+            ci = torch.cat([best_i[qs:qs + QUERY_BATCH], i + ps], dim=1)
+            top_s, pos = cs.topk(k, dim=1)
+            best_s[qs:qs + QUERY_BATCH] = top_s
+            best_i[qs:qs + QUERY_BATCH] = ci.gather(1, pos)
+        del pn, pa
+    return best_s.cpu().numpy(), best_i.cpu().numpy()
+
 
 def process_shard(split: str, country: str, in_dir: Path, out_dir: Path, model, base_out_path: Path):
     print(f"\n--- Shard: {split} / {country} ---")
     t0 = time.perf_counter()
-    
-    # Load Source 1
+
     s1_rec = pl.scan_parquet(config.records_path(split, config.SOURCE1_SRC, in_dir)).filter(pl.col("country") == country)
     s1_norm = pl.scan_parquet(config.norm_path(split, config.SOURCE1_SRC, in_dir)).filter(pl.col("country") == country)
     s1_df = _get_texts(s1_rec, s1_norm)
-    
-    # Load Pool (Source 2 + Source 3)
+
     pool_rec = pl.concat([pl.scan_parquet(config.records_path(split, s, in_dir)) for s in config.CANDIDATE_SRCS]).filter(pl.col("country") == country)
     pool_norm = pl.concat([pl.scan_parquet(config.norm_path(split, s, in_dir)) for s in config.CANDIDATE_SRCS]).filter(pl.col("country") == country)
     pool_df = _get_texts(pool_rec, pool_norm)
-    
+
     print(f"  Source1: {s1_df.height:,} | Pool: {pool_df.height:,}")
     if s1_df.height == 0 or pool_df.height == 0:
         return None
-        
-    chkpt_base = str(base_out_path.parent / f"embed_{split}_{country}")
-    
-    # Embed Pool
-    print("  Embedding Pool (Names)...")
-    pool_name_emb = embed_in_batches(model, pool_df["name_text"].to_list(), checkpoint_prefix=f"{chkpt_base}_pool_name")
-    print("  Embedding Pool (Addresses)...")
-    pool_addr_emb = embed_in_batches(model, pool_df["addr_text"].to_list(), checkpoint_prefix=f"{chkpt_base}_pool_addr")
-    
-    # Concatenate and normalize
-    pool_emb = np.hstack([pool_name_emb, pool_addr_emb])
-    faiss.normalize_L2(pool_emb)
-    
-    # Build FAISS Index
-    print("  Building FAISS index...")
-    dim = pool_emb.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(pool_emb)
-    
-    # Free memory
-    del pool_name_emb, pool_addr_emb, pool_emb
-    gc.collect()
-    
-    # Embed Source 1
-    print("  Embedding Source 1 (Names)...")
-    s1_name_emb = embed_in_batches(model, s1_df["name_text"].to_list())
-    print("  Embedding Source 1 (Addresses)...")
-    s1_addr_emb = embed_in_batches(model, s1_df["addr_text"].to_list())
-    
-    s1_emb = np.hstack([s1_name_emb, s1_addr_emb])
-    faiss.normalize_L2(s1_emb)
-    
-    # Search
-    print("  Searching FAISS...")
-    scores, indices = index.search(s1_emb, config.EMBED_TOP_K)
-    
-    # Construct output DataFrame
+
+    chkpt_base = str(base_out_path.parent / f"embed_{split}_{country.replace(' ', '_')}")
+
+    # Names and addresses stay separate (fp16, normalised); the search sums the two cosines.
+    print("  Embedding Pool (Names)...", flush=True)
+    p_name = embed_in_batches(model, pool_df["name_text"].to_list(), f"{chkpt_base}_pool_name")
+    print("  Embedding Pool (Addresses)...", flush=True)
+    p_addr = embed_in_batches(model, pool_df["addr_text"].to_list(), f"{chkpt_base}_pool_addr")
+    print("  Embedding Source 1 (Names)...", flush=True)
+    q_name = embed_in_batches(model, s1_df["name_text"].to_list(), f"{chkpt_base}_s1_name")
+    print("  Embedding Source 1 (Addresses)...", flush=True)
+    q_addr = embed_in_batches(model, s1_df["addr_text"].to_list(), f"{chkpt_base}_s1_addr")
+
+    print("  Searching (GPU, chunked exact top-k)...", flush=True)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    scores, indices = gpu_topk(q_name, q_addr, p_name, p_addr, config.EMBED_TOP_K, device)
+
     s1_ids = s1_df["entity_id"].to_numpy()
     pool_ids = pool_df["entity_id"].to_numpy()
-    
+
     n_queries, k = indices.shape
-    source1_col = np.repeat(s1_ids, k)
-    candidate_col = pool_ids[indices.flatten()]
-    score_col = scores.flatten()
-    rank_col = np.tile(np.arange(1, k + 1), n_queries)
-    
     out_df = pl.DataFrame({
-        "source1_entity_id": source1_col,
-        "candidate_entity_id": candidate_col,
-        "channel_rank": rank_col.astype(np.uint16),
-        "channel_score": score_col.astype(np.float32)
+        "source1_entity_id": np.repeat(s1_ids, k),
+        "candidate_entity_id": pool_ids[indices.flatten()],
+        "channel_rank": np.tile(np.arange(1, k + 1), n_queries).astype(np.uint16),
+        "channel_score": scores.flatten().astype(np.float32),
     })
-    
+
+    for f in Path(chkpt_base).parent.glob(f"{Path(chkpt_base).name}_*.npy"):
+        f.unlink()  # shard finished; free the disk
     print(f"  Shard done in {time.perf_counter() - t0:.1f}s")
     return out_df
 
@@ -142,6 +141,9 @@ def main(argv=None) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Loading {MODEL_NAME} on {device}...")
     model = SentenceTransformer(MODEL_NAME, device=device)
+    model.max_seq_length = MAX_SEQ_LEN
+    if device == "cuda":
+        model.half()
 
     out_path = config.EMBED_ANN_PATH
     if out_path is None or args.smoke:
