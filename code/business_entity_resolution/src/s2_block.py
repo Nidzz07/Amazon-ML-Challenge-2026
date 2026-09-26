@@ -25,7 +25,7 @@ import polars as pl
 
 import config
 import pipeline_io as pio
-from blocking.common import CHANNEL_SCHEMA, pop_resolved
+from blocking.common import CHANNEL_SCHEMA, pop_notes, pop_resolved
 
 CHANNEL_MODULES = {name: importlib.import_module(f"blocking.{name}") for name in config.CHANNELS}
 assert all(m.NAME == n for n, m in CHANNEL_MODULES.items())
@@ -65,6 +65,7 @@ def channel_pairs(split: str, in_dir, verbose: bool = True, s1_ids: pl.Series | 
             print(f"[{split}/{country}] {s1.height:,} source1 x {pool.height:,} pool")
         for bit, (name, module) in enumerate(CHANNEL_MODULES.items()):
             pop_resolved()
+            pop_notes()
             t0 = time.perf_counter()
             out = module.run(s1, pool, smoke=smoke)
             sec = time.perf_counter() - t0
@@ -73,6 +74,7 @@ def channel_pairs(split: str, in_dir, verbose: bool = True, s1_ids: pl.Series | 
             row = {
                 "split": split, "country": country, "channel": name, "pairs": out.height,
                 "entities": out["source1_entity_id"].n_unique(), "sec": sec, "resolved": pop_resolved(),
+                "notes": pop_notes(),
             }
             stats.append(row)
             if verbose:

@@ -68,3 +68,25 @@ def test_embed_ann_reads_explicit_paths_and_filters_to_shard(tmp_path, monkeypat
 
 def test_embed_ann_empty_shard():
     assert embed_ann.run(norm([]), norm([{"entity_id": "S2-1"}])).is_empty()
+
+
+def test_tfidf_empty_vector_fallback():
+    # Ceiling 0.5 of 4 pool records -> 2: "acme" n-grams (df 3) are dropped, so "acme" gets
+    # an empty vector without the fallback. The other records' vectors must not change.
+    from blocking.tfidf_index import SparseTopNIndex
+
+    pool = pl.Series("t", ["acme", "acme", "acme zeta", "zeta"])
+    queries = pl.Series("t", ["acme", "zeta"])
+    off = SparseTopNIndex(0.5, 100, 1, fallback_n=0).fit(pool)
+    on = SparseTopNIndex(0.5, 100, 1, fallback_n=5).fit(pool)
+    q_off, q_on = off.query_matrix(queries), on.query_matrix(queries)
+    assert q_off[0].nnz == 0 and 0 < q_on[0].nnz <= 5
+    assert q_on[0][:, : on.vocab.height].nnz == 0  # only fallback columns
+    p_off = off._pool_slice_t(0, 4).T.tocsr()
+    p_on = on._pool_slice_t(0, 4).T.tocsr()
+    for r in (2, 3):  # records with n-grams under the ceiling: bit-identical
+        assert (p_off[r] != p_on[r][:, : off.vocab.height]).nnz == 0 and p_on[r].nnz == p_off[r].nnz
+    assert (q_off[1] != q_on[1][:, : off.vocab.height]).nnz == 0
+    hits = {(int(q), int(c)) for qi, ci, _ in on.search(queries, 10) for q, c in zip(qi, ci)}
+    assert {(0, 0), (0, 1)} <= hits  # "acme" query now finds the "acme" pool records
+    assert not any(q == 0 for qi, _, _ in off.search(queries, 10) for q in qi)

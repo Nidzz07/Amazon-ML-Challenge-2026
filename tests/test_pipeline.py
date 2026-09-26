@@ -49,35 +49,70 @@ def test_smoke_pipeline_end_to_end(tmp_path):
         timings[stage.__name__] = time.perf_counter() - t
     total = time.perf_counter() - t0
     print("\n" + "\n".join(f"  {k:<14} {v:6.1f}s" for k, v in timings.items()) + f"\n  {'total':<14} {total:6.1f}s")
-    assert total < BUDGET_SEC, f"smoke chain took {total:.1f}s, budget {BUDGET_SEC}s"
 
-    for split, srcs in config.SPLITS.items():
-        for src in srcs:
-            if src != "ground_truth":
-                pio.check_schema(pl.read_parquet(config.norm_path(split, src, work)), pio.NORM_SCHEMA, f"norm_{split}_{src}")
-        pio.check_schema(pl.read_parquet(config.candidates_path(split, work)), pio.CANDIDATES_SCHEMA, f"candidates_{split}")
-        pio.check_schema(pl.read_parquet(config.scored_path(split, work)), pio.SCORED_SCHEMA, f"scored_{split}")
+    # Every check below runs and is reported even when an earlier one fails, so a
+    # slow run (or one bad schema) can never hide a correctness failure elsewhere.
+    results = {}
+
+    def check(label, fn):
+        try:
+            fn()
+            results[label] = None
+        except Exception as e:
+            results[label] = f"{type(e).__name__}: {e}"
+
+    def check_features(split):
         feats = pl.read_parquet(config.features_path(split, work))
         names, _ = pio.feature_spec()
         want = ["source1_entity_id", "candidate_entity_id", *pio.feature_columns(len(names))]
         want += ["label"] if split == "train" else []
-        assert feats.columns == want
-        assert all(feats[c].dtype == pl.Float32 for c in pio.feature_columns(len(names)))
+        assert feats.columns == want, f"columns {feats.columns} != {want}"
+        bad = [c for c in pio.feature_columns(len(names)) if feats[c].dtype != pl.Float32]
+        assert not bad, f"non-Float32 feature columns {bad}"
         if split == "train":
-            assert feats["label"].dtype == pl.UInt8
+            assert feats["label"].dtype == pl.UInt8, f"label dtype {feats['label'].dtype} != UInt8"
 
-    assert config.model_path(work).exists() and config.calibrator_path(work).exists()
-    assert config.report_path("pytest", work).exists()
+    for split, srcs in config.SPLITS.items():
+        for src in srcs:
+            if src != "ground_truth":
+                check(f"schema norm_{split}_{src}", lambda s=split, r=src: pio.check_schema(
+                    pl.read_parquet(config.norm_path(s, r, work)), pio.NORM_SCHEMA, f"norm_{s}_{r}"))
+        check(f"schema candidates_{split}", lambda s=split: pio.check_schema(
+            pl.read_parquet(config.candidates_path(s, work)), pio.CANDIDATES_SCHEMA, f"candidates_{s}"))
+        check(f"schema scored_{split}", lambda s=split: pio.check_schema(
+            pl.read_parquet(config.scored_path(s, work)), pio.SCORED_SCHEMA, f"scored_{s}"))
+        check(f"schema features_{split}", lambda s=split: check_features(s))
+
+    def check_artifacts():
+        missing = [p.name for p in (config.model_path(work), config.calibrator_path(work),
+                                    config.report_path("pytest", work)) if not p.exists()]
+        assert not missing, f"missing {missing}"
+
+    check("model/calibrator/report exist", check_artifacts)
 
     # The organisers' validator must PASS on the smoke test submission.
-    test_dir = tmp_path / "test_dir"
-    test_dir.mkdir()
-    for src in config.SPLITS["test"]:
-        shutil.copy(config.smoke_raw_path("test", src), test_dir / f"test_{src}.tsv")
-    errors, _ = load_validator().validate(
-        str(config.matching_results_path("test", work)),
-        str(config.candidate_pairs_path("test", work)),
-        str(test_dir),
-        check_ids=True,
-    )
-    assert errors == []
+    def check_validator():
+        test_dir = tmp_path / "test_dir"
+        test_dir.mkdir()
+        for src in config.SPLITS["test"]:
+            shutil.copy(config.smoke_raw_path("test", src), test_dir / f"test_{src}.tsv")
+        errors, _ = load_validator().validate(
+            str(config.matching_results_path("test", work)),
+            str(config.candidate_pairs_path("test", work)),
+            str(test_dir),
+            check_ids=True,
+        )
+        assert errors == [], f"validator errors {errors}"
+
+    check("validator", check_validator)
+
+    # Timing last: it is reported alongside, never instead of, the correctness checks.
+    def check_budget():
+        assert total < BUDGET_SEC, f"smoke chain took {total:.1f}s, budget {BUDGET_SEC}s"
+
+    check(f"timing < {BUDGET_SEC}s", check_budget)
+
+    print("\n" + "\n".join(f"  {'PASS' if err is None else 'FAIL'}  {label}" for label, err in results.items()))
+    failures = {label: err for label, err in results.items() if err is not None}
+    assert not failures, f"{len(failures)} of {len(results)} checks failed:\n" + "\n".join(
+        f"  {label}: {err}" for label, err in failures.items())
