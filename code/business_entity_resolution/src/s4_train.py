@@ -95,6 +95,7 @@ def main(argv=None) -> None:
     ap = pio.parser(__doc__)
     ap.add_argument("--neg-ratio", type=float, default=NEG_TO_POS_RATIO)
     ap.add_argument("--entity-frac", type=float, default=ENTITY_SUBSAMPLE_FRAC)
+    ap.add_argument("--transfer-test", action="store_true", help="Run the France proxy transfer test and exit")
     args = ap.parse_args(argv)
     in_dir, out_dir = pio.dirs(args)
     t0 = time.perf_counter()
@@ -114,6 +115,48 @@ def main(argv=None) -> None:
 
     df = feat_lf.collect()
     print(f"  Loaded {len(df):,} rows, {df['label'].mean():.4f} positive rate")
+
+    if args.transfer_test:
+        print("\n--- Running France Proxy Transfer Test ---")
+        s1_meta = pl.read_parquet(config.records_path("train", "config.SOURCE1_SRC" if not hasattr(config, "SOURCE1_SRC") else config.SOURCE1_SRC, in_dir), columns=["entity_id", "country"]) if hasattr(config, "SOURCE1_SRC") else pl.read_parquet(config.records_path("train", "source1", in_dir), columns=["entity_id", "country"])
+        df = df.join(s1_meta.rename({"entity_id": "source1_entity_id"}), on="source1_entity_id", how="left")
+        
+        us_df = df.filter(pl.col("country") == "US")
+        in_df = df.filter(pl.col("country") == "India")
+        
+        us_pos = us_df.filter(pl.col("label") == 1)
+        us_neg = _sample_negatives(us_df, len(us_pos), args.neg_ratio, config.SEED, feature_names)
+        us_df = pl.concat([us_pos, us_neg])
+        
+        in_pos = in_df.filter(pl.col("label") == 1)
+        in_neg = _sample_negatives(in_df, len(in_pos), args.neg_ratio, config.SEED, feature_names)
+        in_df = pl.concat([in_pos, in_neg])
+        
+        try:
+            from features import FEATURE_MONOTONES
+            mono = FEATURE_MONOTONES
+        except ImportError:
+            mono = [0] * len(feature_cols)
+        params = {**LGB_PARAMS, "monotone_constraints": mono}
+        
+        def train_and_eval(tr_df, te_df, tr_name, te_name):
+            X_tr, y_tr = tr_df.select(feature_cols).to_numpy(), tr_df["label"].to_numpy()
+            X_te, y_te = te_df.select(feature_cols).to_numpy(), te_df["label"].to_numpy()
+            dtr = lgb.Dataset(X_tr, label=y_tr, feature_name=feature_cols, free_raw_data=False)
+            model = lgb.train(params, dtr, num_boost_round=100)
+            preds = model.predict(X_te)
+            auc = roc_auc_score(y_te, preds)
+            print(f"  Train: {tr_name:5s} | Eval: {te_name:13s} | AUC: {auc:.4f}")
+            return auc
+            
+        print("  Evaluating US -> India (transfer proxy)")
+        train_and_eval(us_df, us_df, "US", "US (in-dist)")
+        train_and_eval(us_df, in_df, "US", "India")
+        
+        print("\n  Evaluating India -> US (transfer proxy)")
+        train_and_eval(in_df, in_df, "India", "India (in-dist)")
+        train_and_eval(in_df, us_df, "India", "US")
+        return
 
     # ── 2. Entity subsample ───────────────────────────────────────────────
     all_entities = df["source1_entity_id"].unique().to_list()
