@@ -1,5 +1,7 @@
 """Channel exact_key: hash join on the key families in config.EXACT_KEY_FAMILIES
-((street_num, city_norm), (postcode, street_num), (name_acronym, city_norm)).
+((street_num, city_norm), (postcode, street_num), (name_acronym, city_norm),
+(street_num, state_canon)). city_norm, state_canon and postcode come from
+normalise.parse_address_components; street_num is the verbatim house-number token.
 
 A key needs every component non-empty. Any key whose bucket holds more than
 config.EXACT_KEY_MAX_BUCKET records on EITHER side is dropped as noise. No
@@ -15,7 +17,8 @@ from blocking.common import empty, rank_within_entity
 NAME = "exact_key"
 
 
-def _family_pairs(s1: pl.DataFrame, pool: pl.DataFrame, cols: tuple[str, ...]) -> pl.DataFrame:
+def family_pairs(s1: pl.DataFrame, pool: pl.DataFrame, cols: tuple[str, ...]) -> pl.DataFrame:
+    """(source1_entity_id, candidate_entity_id, bucket) agreeing on every column of one family."""
     def keyed(df: pl.DataFrame) -> pl.DataFrame:
         nonempty = pl.all_horizontal([pl.col(c) != "" for c in cols])
         return (
@@ -36,8 +39,9 @@ def _family_pairs(s1: pl.DataFrame, pool: pl.DataFrame, cols: tuple[str, ...]) -
     )
 
 
-def run(s1: pl.DataFrame, pool: pl.DataFrame) -> pl.DataFrame:
-    parts = [_family_pairs(s1, pool, cols) for cols in config.EXACT_KEY_FAMILIES]
+def run(s1: pl.DataFrame, pool: pl.DataFrame, families=config.EXACT_KEY_FAMILIES) -> pl.DataFrame:
+    """`families` defaults to config; the cap sweep passes a subset to ablate one family."""
+    parts = [family_pairs(s1, pool, cols) for cols in families]
     pairs = pl.concat(parts)
     if pairs.is_empty():
         return empty()

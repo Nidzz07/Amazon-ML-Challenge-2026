@@ -31,26 +31,34 @@ CHANNEL_MODULES = {name: importlib.import_module(f"blocking.{name}") for name in
 assert all(m.NAME == n for n, m in CHANNEL_MODULES.items())
 
 
-def load_shard(split: str, in_dir, country: str) -> tuple[pl.DataFrame, pl.DataFrame]:
+def load_shard(split: str, in_dir, country: str, s1_ids: pl.Series | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
+    """One country's Source-1 rows (optionally only `s1_ids`, e.g. the held-out
+    validation entities) and its full S2+S3 pool."""
     s1 = pl.scan_parquet(config.norm_path(split, config.SOURCE1_SRC, in_dir)).filter(pl.col("country") == country)
+    if s1_ids is not None:
+        s1 = s1.filter(pl.col("entity_id").is_in(s1_ids.implode()))
     pool = pl.concat(
         [pl.scan_parquet(config.norm_path(split, s, in_dir)) for s in config.CANDIDATE_SRCS]
     ).filter(pl.col("country") == country)
     return s1.collect(), pool.collect()
 
 
-def channel_pairs(split: str, in_dir, verbose: bool = True) -> tuple[pl.DataFrame, list[dict]]:
+def channel_pairs(split: str, in_dir, verbose: bool = True, s1_ids: pl.Series | None = None,
+                  countries: list[str] | None = None) -> tuple[pl.DataFrame, list[dict]]:
     """Long (source1_entity_id, candidate_entity_id, channel_rank, channel_score, bit)
-    from every channel on every shard, plus per shard x channel stats."""
-    countries = (
-        pl.scan_parquet(config.norm_path(split, config.SOURCE1_SRC, in_dir))
-        .select(pl.col("country").unique().sort())
-        .collect()["country"]
-        .to_list()
-    )
+    from every channel on every shard, plus per shard x channel stats. `s1_ids`
+    restricts the Source-1 side (the pool is always complete); `countries` restricts
+    which shards run (shards are independent, so per-country runs combine exactly)."""
+    if countries is None:
+        countries = (
+            pl.scan_parquet(config.norm_path(split, config.SOURCE1_SRC, in_dir))
+            .select(pl.col("country").unique().sort())
+            .collect()["country"]
+            .to_list()
+        )
     parts, stats = [], []
     for country in countries:
-        s1, pool = load_shard(split, in_dir, country)
+        s1, pool = load_shard(split, in_dir, country, s1_ids)
         if verbose:
             print(f"[{split}/{country}] {s1.height:,} source1 x {pool.height:,} pool")
         for bit, (name, module) in enumerate(CHANNEL_MODULES.items()):
