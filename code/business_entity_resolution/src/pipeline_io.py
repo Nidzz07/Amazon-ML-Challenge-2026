@@ -2,6 +2,7 @@
 and the submission TSV writer. No stage logic lives here."""
 import argparse
 import subprocess
+import sys
 from pathlib import Path
 
 import polars as pl
@@ -100,6 +101,29 @@ def git_sha() -> str:
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError):
         return "nogit"
+
+
+def peak_rss_bytes() -> int | None:
+    """Peak resident memory of this process so far (Windows: peak working set), stdlib
+    only. It never goes down, so it covers everything the process has run until now."""
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class Counters(ctypes.Structure):  # PROCESS_MEMORY_COUNTERS
+            _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD)] + [
+                (f, ctypes.c_size_t) for f in (
+                    "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage", "QuotaPagedPoolUsage",
+                    "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage", "PagefileUsage", "PeakPagefileUsage")]
+
+        k32 = ctypes.WinDLL("kernel32")
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.K32GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.c_void_p, wintypes.DWORD]
+        c = Counters(cb=ctypes.sizeof(Counters))
+        return c.PeakWorkingSetSize if k32.K32GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(c), c.cb) else None
+    import resource
+    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return peak if sys.platform == "darwin" else peak * 1024  # Linux reports KiB, macOS bytes
 
 
 def write_id_lists(s1_ids: pl.Series, pairs: pl.DataFrame, list_col: str, path: Path) -> None:
