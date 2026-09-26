@@ -1,0 +1,15 @@
+venv/
+data/
+artifacts/
+output/
+*.parquet
+__pycache__/
+*.pyc
+.env
+*.log
+model.txt
+calibrator.pkl
+.pytest_cache/
+.DS_Store
+.ipynb_checkpoints/
+*.pkl
