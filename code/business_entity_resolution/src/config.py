@@ -120,6 +120,22 @@ SMOKE_TEST_MIN_PER_COUNTRY = 500  # every test country (France included) gets at
 # Normalisation (S1). Rows per slice; bounds peak memory on the 5M-row pool files.
 S1_CHUNK_ROWS = 1_000_000
 
+# Featurisation (S3). The test split is ~52M candidate pairs (1,732,544 entities x
+# MAX_CANDIDATES_PER_ENTITY), so the feature matrix is never materialised: s3 shards
+# by country, then walks each shard in blocks and chunks, appending to the parquet.
+#   S3_CHUNK_ROWS       pairs per features.featurise() call. This is what bounds peak
+#                       memory, since featurise holds ~71 float32 columns plus the
+#                       Python string lists the rapidfuzz/Jaro-Winkler paths need.
+#                       10k keeps a chunk's working set at tens of MB. Raise it on a
+#                       bigger box: the vectorised paths get faster with more rows
+#                       per call (measured ~1.5x from 10k to 50k), memory scales
+#                       linearly.
+#   S3_JOIN_BLOCK_ROWS  pairs per join of the wide norm frames. Only amortises the
+#                       hash joins (one per block instead of one per chunk); must be
+#                       >= S3_CHUNK_ROWS and is clamped up if it is not.
+S3_CHUNK_ROWS = 10_000
+S3_JOIN_BLOCK_ROWS = 250_000
+
 # Blocking.
 # Channel bit positions in candidates.channels (uint8 bitmask).
 CHANNELS = ("name_tfidf", "addr_tfidf", "exact_key", "rare_token", "embed_ann")
