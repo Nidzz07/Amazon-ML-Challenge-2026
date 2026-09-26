@@ -462,3 +462,34 @@ Methodology document must include: (1) the metric derivation showing F0.5 = 1.25
 - [ ] `requirements.txt` pins every version; model licence named in write-up
 - [ ] `submissions.md` version history complete
 - [ ] Zip structure matches exactly, `Documentation_template.md` still named that
+
+---
+
+## Decisions log
+
+### 2026-09-26 — Candidate cap set to 30 (provisional)
+
+Following the organisers' update that candidate_pairs.tsv size is scored
+independently of the leaderboard, ran a full cap sweep (K=10,15,20,25,30,
+40,50,60,uncapped) on the smoke validation set. Recall gain per additional
+candidate flattens sharply past K=30 (30→40 gains 0.16pts, 50→60 gains
+only 0.04pts). Chose K=30: 0.9878 recall (India 0.9805, US 0.9926) vs
+0.9908 at K=60, a 0.30-point cost for a 45.5% reduction in candidate
+pairs (2,752,283 to 1,499,998 on smoke train).
+
+Per-channel finding: pairs found by multiple channels are almost never
+cut by the cap (>99% survive even at K=10) — nearly all recall loss at
+low K comes from pairs only ONE channel found, and rare_token's exclusive
+finds are hit hardest (only 48% survive at K=20 vs 85-88% for the two
+TF-IDF channels), because the ranking score sums 1/rank across channels
+and a single-channel find has nothing to add to its rank.
+
+Caveats, must revisit before finalising: (1) smoke's per-country shards
+are 93k-140k records vs 4-5M at full scale, so full-scale recall at any
+given K will sit lower than measured here — this cap is not validated at
+scale yet. (2) embed_ann contributed 0 pairs (not yet wired in) — its
+addition will change the union and may shift the right K. (3) France has
+no ground truth, so this analysis says nothing about French recall.
+
+Full sweep data: artifacts/smoke/reports/cap_sweep.json (gitignored,
+regenerate with src/sweep_candidate_cap.py --smoke).

@@ -120,7 +120,11 @@ SMOKE_TEST_MIN_PER_COUNTRY = 500  # every test country (France included) gets at
 # Blocking.
 # Channel bit positions in candidates.channels (uint8 bitmask).
 CHANNELS = ("name_tfidf", "addr_tfidf", "exact_key", "rare_token", "embed_ann")
-MAX_CANDIDATES_PER_ENTITY = 60
+# PROVISIONAL — chosen from a smoke-only cap sweep (artifacts/smoke/reports/
+# cap_sweep.json, 2026-09-26). Must be re-validated on the real 400k
+# validation split once normalisation and embed_ann are real, since smoke
+# under-represents full-scale candidate competition per entity.
+MAX_CANDIDATES_PER_ENTITY = 30
 EXACT_KEY_MAX_BUCKET = 500
 
 # Assembly (S6). How the empty prediction (m = 0) is scored in the expected-F0.5
