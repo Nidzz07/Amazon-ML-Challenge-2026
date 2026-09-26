@@ -15,6 +15,8 @@ import config
 from blocking.common import empty, rank_within_entity
 
 NAME = "exact_key"
+# The only norm columns run() reads (every family's key columns); s2_block loads just these.
+COLUMNS = ("entity_id", *dict.fromkeys(c for fam in config.EXACT_KEY_FAMILIES for c in fam))
 
 
 def family_pairs(s1: pl.DataFrame, pool: pl.DataFrame, cols: tuple[str, ...]) -> pl.DataFrame:

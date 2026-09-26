@@ -48,17 +48,25 @@ from blocking.common import CHANNEL_SCHEMA, pop_notes, pop_resolved
 
 CHANNEL_MODULES = {name: importlib.import_module(f"blocking.{name}") for name in config.CHANNELS}
 assert all(m.NAME == n for n, m in CHANNEL_MODULES.items())
+# Each channel declares the norm columns it reads, and is handed only those: loading every
+# column of the full US shard alone passed 13 GB. A channel reading an undeclared column
+# fails with ColumnNotFoundError, never silently.
+assert all(set(m.COLUMNS) <= set(pio.NORM_SCHEMA) and "entity_id" in m.COLUMNS for m in CHANNEL_MODULES.values())
 
 
-def load_shard(split: str, in_dir, country: str, s1_ids: pl.Series | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
+def load_shard(split: str, in_dir, country: str, s1_ids: pl.Series | None = None,
+               columns: tuple[str, ...] | None = None) -> tuple[pl.DataFrame, pl.DataFrame]:
     """One country's Source-1 rows (optionally only `s1_ids`, e.g. the held-out
-    validation entities) and its full S2+S3 pool."""
+    validation entities) and its full S2+S3 pool: every column, or only `columns`.
+    Projection selects after the same filters, so rows and their order do not change."""
     s1 = pl.scan_parquet(config.norm_path(split, config.SOURCE1_SRC, in_dir)).filter(pl.col("country") == country)
     if s1_ids is not None:
         s1 = s1.filter(pl.col("entity_id").is_in(s1_ids.implode()))
     pool = pl.concat(
         [pl.scan_parquet(config.norm_path(split, s, in_dir)) for s in config.CANDIDATE_SRCS]
     ).filter(pl.col("country") == country)
+    if columns is not None:
+        s1, pool = s1.select(columns), pool.select(columns)
     return s1.collect(), pool.collect()
 
 
@@ -74,11 +82,13 @@ def channel_pairs(split: str, in_dir, verbose: bool = True, s1_ids: pl.Series | 
         countries = split_countries(split, in_dir)
     parts, stats = [], []
     for country in countries:
-        s1, pool = load_shard(split, in_dir, country, s1_ids)
         if verbose:
-            print(f"[{split}/{country}] {s1.height:,} source1 x {pool.height:,} pool")
+            n_s1, n_pool = (f.height for f in load_shard(split, in_dir, country, s1_ids, ("entity_id",)))
+            print(f"[{split}/{country}] {n_s1:,} source1 x {n_pool:,} pool")
         for bit, (name, module) in enumerate(CHANNEL_MODULES.items()):
+            s1, pool = load_shard(split, in_dir, country, s1_ids, module.COLUMNS)
             out, row = run_channel(split, country, bit, name, module, s1, pool, smoke, verbose)
+            del s1, pool
             stats.append(row)
             parts.append(out)
     long = pl.concat(parts) if parts else pl.DataFrame(schema={**CHANNEL_SCHEMA, "bit": pl.UInt8})
@@ -205,19 +215,20 @@ def block_checkpointed(split: str, in_dir, out_dir, s1_ids: pl.Series | None, sm
             country_parts.append(cpath)
             continue
         t0 = time.perf_counter()
-        s1, pool = load_shard(split, in_dir, country, s1_ids)
-        print(f"[{split}/{country}] {s1.height:,} source1 x {pool.height:,} pool", flush=True)
+        n_s1, n_pool = (f.height for f in load_shard(split, in_dir, country, s1_ids, ("entity_id",)))
+        print(f"[{split}/{country}] {n_s1:,} source1 x {n_pool:,} pool", flush=True)
         ch_paths = []
         for bit, (name, module) in enumerate(CHANNEL_MODULES.items()):
             path = pdir / f"{country}_{name}.parquet"
             if path.exists():
                 print(f"  {name:<11} done in an earlier run, skipped", flush=True)
             else:
+                s1, pool = load_shard(split, in_dir, country, s1_ids, module.COLUMNS)
                 out, _ = run_channel(split, country, bit, name, module, s1, pool, smoke, True)
+                del s1, pool
                 write_atomic(out, path)
                 del out
             ch_paths.append(path)
-        del s1, pool
         capped, n_u = cap_from_parts(ch_paths, config.S2_UNION_BUCKETS)
         write_atomic(capped, cpath)
         n_uncapped += n_u
