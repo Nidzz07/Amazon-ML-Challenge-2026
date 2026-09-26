@@ -203,7 +203,9 @@ def main(argv=None) -> None:
     shard_paths = []
 
     for split in config.SPLITS:
-        if not config.norm_path(split, config.SOURCE1_SRC, in_dir).exists():
+        needed = [config.norm_path(split, src, in_dir) for src in (config.SOURCE1_SRC, *config.CANDIDATE_SRCS)]
+        if not all(p.exists() for p in needed):
+            print(f"[{split}] missing normalised inputs, skipping split.")
             continue
 
         countries = (
