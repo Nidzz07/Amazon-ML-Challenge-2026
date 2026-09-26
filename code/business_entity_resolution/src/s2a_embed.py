@@ -151,9 +151,14 @@ def process_shard(split: str, country: str, in_dir: Path, out_dir: Path, model, 
     for ci, start in enumerate(range(0, n_pool, CHUNK)):
         names = pool_df["name_text"].slice(start, CHUNK).to_list()
         addrs = pool_df["addr_text"].slice(start, CHUNK).to_list()
-        pn = embed_chunk(model, names, f"{chkpt_base}_pool_name_{ci:04d}.npy")
-        pa = embed_chunk(model, addrs, f"{chkpt_base}_pool_addr_{ci:04d}.npy")
+        name_f = f"{chkpt_base}_pool_name_{ci:04d}.npy"
+        addr_f = f"{chkpt_base}_pool_addr_{ci:04d}.npy"
+        pn = embed_chunk(model, names, name_f)
+        pa = embed_chunk(model, addrs, addr_f)
         topk.update(pn, pa, start)
+        # Kaggle's /kaggle/working is ~20 GB; the US pool chunks alone would exceed it, so drop each once searched.
+        Path(name_f).unlink(missing_ok=True)
+        Path(addr_f).unlink(missing_ok=True)
         print(f"      pool {min(start + CHUNK, n_pool):,}/{n_pool:,}  ({time.perf_counter() - t0:.0f}s)", flush=True)
     scores, indices = topk.result()
 
