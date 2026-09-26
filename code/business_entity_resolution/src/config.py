@@ -109,6 +109,16 @@ CANDIDATE_SRCS = ("source2", "source3")
 VAL_SIZE = 400_000
 VAL_ENTITY_IDS = ARTIFACTS_DIR / "val_entity_ids.parquet"
 
+# S2 train-entity subsample. TRAIN ONLY: the test split is never sampled (asserted in
+# pipeline_io.sample_train_entities). 0 = block every train entity: the default, OFF.
+# Subsampling distorts cand_n_claims, cand_best_score and cand_is_argmax: unsampled
+# entities never get blocked, so they never claim pool records, and train sees fewer
+# competitors per pool record than test (smoke, 10% sample: is_argmax 0.164 -> 0.649).
+# Enable it only via s2_block --train-entities N as a deliberate time-vs-accuracy
+# tradeoff. When on, s2 blocks every held-out validation entity (s7 scores them) plus N
+# others, stratified by country, seeded with SEED; the S2/S3 pool is never sampled.
+S2_TRAIN_ENTITIES = 0
+
 # Smoke sample.
 SMOKE_TRAIN_ENTITIES = 50_000
 # Distractor S2/S3 records per true-match record. 0.35 reproduces full-scale pool
@@ -204,6 +214,18 @@ RARE_TOKEN_TOP_K = 100
 EMBED_ANN_FILENAME = "embed_ann_pairs.parquet"
 EMBED_ANN_PATH = None
 EMBED_TOP_K = 20
+
+
+# S2 checkpoints. s2_block writes each (country, channel) output and each country's capped
+# candidates under s2_parts_dir as it finishes them; --resume skips finished ones.
+S2_PARTS_DIRNAME = "s2_parts"
+# Union + cap runs per country in this many hash buckets of Source-1 ids, so a whole
+# shard's uncapped union never sits in memory at once. Output does not depend on it.
+S2_UNION_BUCKETS = 8
+
+
+def s2_parts_dir(split: str, artifacts_dir: Path = ARTIFACTS_DIR) -> Path:
+    return Path(artifacts_dir) / S2_PARTS_DIRNAME / split
 
 
 def embed_ann_path(smoke: bool) -> Path:
