@@ -3,13 +3,18 @@
 Loads the LightGBM model and isotonic calibrator. Refuses to run if the
 model's FEATURE_VERSION doesn't match the current features.py. Scores in
 ~5M-pair shards so the full inference feature matrix is never materialised
-on disk (it would be ~25 GB). Writes only (source1_entity_id,
+on disk (it would be ~25 GB). Each scored shard is appended straight to
+scored_{split}.parquet (written to a .tmp file, renamed when complete), so memory
+is one shard however many pairs there are. Writes only (source1_entity_id,
 candidate_entity_id, prob float32).
 
 Usage:
     python s5_score.py [--smoke] [--input DIR] [--output DIR]
+    python s5_score.py --splits test                 # only what is asked; default is every split with features
+    python s5_score.py --splits train --val-only     # only the held-out validation entities (what s7 evaluates)
 """
 import json
+import os
 import pickle
 import sys
 import time
@@ -17,11 +22,13 @@ import time
 import lightgbm as lgb
 import numpy as np
 import polars as pl
+import pyarrow.parquet as pq
 
 import config
 import pipeline_io as pio
+from s4_train import ID, iter_entity_batches
 
-SHARD_ROWS = 5_000_000   # pairs per in-memory shard; fits comfortably in 24 GB
+SHARD_ROWS = 1_000_000   # pairs per in-memory shard: peak RAM ~2.7 GB flat (5M-row shards peaked at 9 GB)
 
 
 def load_model_and_calibrator(in_dir):
@@ -69,7 +76,7 @@ def score_shard(
     feature_cols: list[str],
 ) -> pl.DataFrame:
     """Score one shard, apply calibration, return (s1_id, cand_id, prob)."""
-    X = shard.select(feature_cols).to_numpy(allow_copy=True)
+    X = shard.select(feature_cols).to_numpy(order="c")
     raw = model.predict(X)
 
     if hasattr(calibrator, "transform"):      # IsotonicRegression
@@ -99,8 +106,50 @@ def stub_score_shard(shard: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def score_split(split: str, in_dir, out_dir, model, calibrator, is_stub: bool, feature_cols: list[str],
+                shard_rows: int, val_only: bool, smoke: bool) -> int:
+    """Stream features_{split} -> scored_{split}.parquet, one shard in memory at a time."""
+    feat_path = config.features_path(split, in_dir)
+    keep = None
+    if val_only and split == "train":
+        keep = pio.val_ids(smoke)
+        if keep is None:
+            print("  --val-only: no held-out validation ids found (smoke run?), scoring every entity")
+    n_total = pq.ParquetFile(str(feat_path)).metadata.num_rows
+    print(f"\n{split}: {n_total:,} pairs in {feat_path.name}"
+          + (f", keeping only {keep.len():,} validation entities" if keep is not None else ""), flush=True)
+
+    out = config.scored_path(split, out_dir)
+    tmp = out.with_name(out.name + ".tmp")
+    schema = pl.DataFrame(schema=pio.SCORED_SCHEMA).to_arrow().schema
+    written, seen, t0 = 0, 0, time.perf_counter()
+    with pq.ParquetWriter(str(tmp), schema) as writer:
+        for i, shard in enumerate(iter_entity_batches(feat_path, [ID, "candidate_entity_id", *feature_cols], shard_rows)):
+            seen += shard.height
+            if keep is not None:
+                shard = shard.filter(pl.col(ID).is_in(keep.implode()))
+            if not shard.height:
+                continue
+            result = stub_score_shard(shard) if is_stub else score_shard(shard, model, calibrator, feature_cols)
+            pio.check_schema(result, pio.SCORED_SCHEMA, f"scored_{split}")
+            writer.write_table(result.to_arrow().cast(schema))
+            written += result.height
+            del shard, result   # release RAM immediately
+            rate = seen / max(time.perf_counter() - t0, 1e-9)
+            print(f"    shard {i:4d}: {seen:>12,} read  {written:>12,} scored  {rate:>9,.0f} rows/s", flush=True)
+    os.replace(tmp, out)
+    print(f"  -> {out.name}  {written:,} pairs")
+    return written
+
+
 def main(argv=None) -> None:
-    args = pio.parser(__doc__).parse_args(argv)
+    ap = pio.parser(__doc__)
+    ap.add_argument("--splits", nargs="+", choices=list(config.SPLITS), default=None,
+                    help="splits to score (default: every split that has a features file)")
+    ap.add_argument("--val-only", action="store_true",
+                    help="for the train split, score only the held-out validation entities")
+    ap.add_argument("--shard-rows", type=int, default=SHARD_ROWS, help="pairs per in-memory shard")
+    args = ap.parse_args(argv)
     in_dir, out_dir = pio.dirs(args)
     t0 = time.perf_counter()
 
@@ -109,38 +158,15 @@ def main(argv=None) -> None:
     feature_cols = pio.feature_columns(len(feature_names))
     is_stub = meta.get("kind") == "stub"
 
-    for split in config.SPLITS:
-        feat_path = config.features_path(split, in_dir)
-        if not feat_path.exists():
-            print(f"  {feat_path.name} not found — skipping {split}")
+    for split in (args.splits or list(config.SPLITS)):
+        if not config.features_path(split, in_dir).exists():
+            print(f"  {config.features_path(split, in_dir).name} not found — skipping {split}")
             continue
+        score_split(split, in_dir, out_dir, model, calibrator, is_stub, feature_cols,
+                    args.shard_rows, args.val_only, args.smoke)
 
-        lf = pl.scan_parquet(feat_path)
-        total = lf.select(pl.len()).collect().item()
-        n_shards = max(1, (total + SHARD_ROWS - 1) // SHARD_ROWS)
-        print(f"\n{split}: {total:,} pairs across {n_shards} shard(s)")
-
-        results = []
-        for i in range(n_shards):
-            shard = lf.slice(i * SHARD_ROWS, SHARD_ROWS).collect()
-
-            if is_stub:
-                result = stub_score_shard(shard)
-            else:
-                result = score_shard(shard, model, calibrator, feature_cols)
-
-            results.append(result)
-            del shard   # release RAM immediately
-
-        scored = pl.concat(results)
-        pio.check_schema(scored, pio.SCORED_SCHEMA, f"scored_{split}")
-
-        out = config.scored_path(split, out_dir)
-        scored.write_parquet(out)
-        print(f"  -> {out.name}  {scored.height:,} pairs")
-        del results, scored
-
-    print(f"\ns5 done in {time.perf_counter() - t0:.1f}s")
+    peak = pio.peak_rss_bytes()
+    print(f"\ns5 done in {time.perf_counter() - t0:.1f}s" + (f", peak RSS {peak / 2**30:.2f} GB" if peak else ""))
 
 
 if __name__ == "__main__":
