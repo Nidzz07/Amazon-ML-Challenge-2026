@@ -102,7 +102,15 @@ class SparseTopNIndex:
     """Exact sparse cosine top-k via sparse_dot_topn, queries processed in chunks.
     With max_df set, n-grams in more than max_df pool records are dropped first
     (see config.TFIDF_MAX_DF): cosine over the remaining n-grams. max_df is a fraction
-    of the pool or a count; fit() stores the count it resolved to in max_df_resolved."""
+    of the pool or a count; fit() stores the count it resolved to in max_df_resolved.
+
+    Pool-side chunking: to avoid building a single giant (vocab × pool) matrix when
+    max_df is relaxed (e.g. 0.2 × 4M docs = 800k n-gram vocab), the pool is split
+    into slices of POOL_CHUNK_DOCS rows. search() merges top-k across slices so
+    output is identical to the full-matrix version."""
+
+    # Maximum pool rows to materialise at once as a sparse matrix.
+    POOL_CHUNK_DOCS = 500_000
 
     def __init__(self, max_df=config.TFIDF_MAX_DF, chunk_rows=config.TFIDF_CHUNK_ROWS, n_threads=config.BLOCKING_THREADS):
         self.max_df, self.chunk_rows, self.n_threads = max_df, chunk_rows, n_threads
@@ -111,18 +119,64 @@ class SparseTopNIndex:
         grams = char_ngrams(texts)
         self.max_df_resolved = resolve_df(f"TFIDF_MAX_DF[{texts.name}]", self.max_df, len(texts))
         self.vocab = fit_vocab(grams, len(texts), self.max_df_resolved)
-        w = _weights(grams, self.vocab).sort("gid", "doc")
-        # Stored transposed (vocab x pool): the right-hand operand of Q @ C.T.
-        self.pool_t = _csr(w["gid"].to_numpy(), w["doc"].to_numpy(), w["w"].to_numpy(), (self.vocab.height, len(texts)))
+        self._pool_grams = grams          # keep raw grams; build sliced matrices in search()
+        self._pool_len = len(texts)
         return self
 
+    def _pool_slice_t(self, start: int, end: int) -> sp.csr_matrix:
+        """Build the transposed (vocab × slice) pool matrix for docs [start, end)."""
+        slice_grams = self._pool_grams.filter(
+            pl.col("doc").is_between(start, end - 1)
+        ).with_columns((pl.col("doc") - start).alias("doc"))   # re-index to 0
+        w = _weights(slice_grams, self.vocab).sort("gid", "doc")
+        n_slice = end - start
+        return _csr(
+            w["gid"].to_numpy(), w["doc"].to_numpy(), w["w"].to_numpy(),
+            (self.vocab.height, n_slice)
+        )
+
     def search(self, texts: pl.Series, k: int) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-        q = tfidf_matrix(char_ngrams(texts), self.vocab, len(texts))
-        for start in range(0, q.shape[0], self.chunk_rows):
-            res = sp_matmul_topn(
-                q[start : start + self.chunk_rows], self.pool_t, top_n=k, sort=True, n_threads=self.n_threads
-            ).tocoo()
-            yield res.row.astype(np.int64) + start, res.col.astype(np.int64), res.data.astype(np.float32)
+        q_full = tfidf_matrix(char_ngrams(texts), self.vocab, len(texts))
+        pool_slices = list(range(0, self._pool_len, self.POOL_CHUNK_DOCS))
+
+        for q_start in range(0, q_full.shape[0], self.chunk_rows):
+            q_chunk = q_full[q_start: q_start + self.chunk_rows]
+            n_q = q_chunk.shape[0]
+
+            # Collect top-k across pool slices then merge.
+            best_scores = np.full((n_q, k), -np.inf, dtype=np.float32)
+            best_cols   = np.full((n_q, k), -1,      dtype=np.int64)
+
+            for p_start in pool_slices:
+                p_end = min(p_start + self.POOL_CHUNK_DOCS, self._pool_len)
+                pool_t_slice = self._pool_slice_t(p_start, p_end)
+                res = sp_matmul_topn(
+                    q_chunk, pool_t_slice, top_n=k, sort=True, n_threads=self.n_threads
+                ).tocoo()
+                if res.nnz == 0:
+                    continue
+                # Merge into running top-k using a simple insertion approach.
+                for qi, ci, sc in zip(res.row.astype(np.int64),
+                                       res.col.astype(np.int64) + p_start,
+                                       res.data.astype(np.float32)):
+                    # Find the position where this score belongs.
+                    slot = np.searchsorted(-best_scores[qi], -sc)
+                    if slot < k:
+                        best_scores[qi, slot + 1:] = best_scores[qi, slot:-1]
+                        best_cols[qi,   slot + 1:] = best_cols[qi,   slot:-1]
+                        best_scores[qi, slot] = sc
+                        best_cols[qi,   slot] = ci
+
+            # Yield only valid (found) entries.
+            mask = best_cols >= 0
+            if not mask.any():
+                continue
+            qi_idx, rank_idx = np.where(mask)
+            yield (
+                qi_idx.astype(np.int64) + q_start,
+                best_cols[qi_idx, rank_idx],
+                best_scores[qi_idx, rank_idx],
+            )
 
 
 # Factories read config at call time, so a knob changed at runtime takes effect.
@@ -155,3 +209,4 @@ def tfidf_channel(s1: pl.DataFrame, pool: pl.DataFrame, text_col: str, k: int = 
     if not parts:
         return empty()
     return rank_within_entity(pl.concat(parts), ["score"], [True], "score")
+
