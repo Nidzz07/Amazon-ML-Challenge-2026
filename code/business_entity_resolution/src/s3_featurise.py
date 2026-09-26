@@ -46,7 +46,7 @@ import pyarrow.parquet as pq
 
 import config
 import pipeline_io as pio
-from features import FEATURE_NAMES, FEATURE_VERSION, NUM_FEATURES, featurise
+from features import EMBED_RANK_MISSING, FEATURE_NAMES, FEATURE_VERSION, NUM_FEATURES, featurise
 
 try:  # optional: not in requirements.txt, only used for the memory line
     import psutil
@@ -206,8 +206,8 @@ def _join_block(
     out = out.with_columns(
         pl.col("embed_cosine").fill_null(0.0).cast(pl.Float32) if "embed_cosine" in out.columns
         else pl.lit(0.0, dtype=pl.Float32).alias("embed_cosine"),
-        pl.col("embed_rank").fill_null(0.0).cast(pl.Float32) if "embed_rank" in out.columns
-        else pl.lit(0.0, dtype=pl.Float32).alias("embed_rank"),
+        pl.col("embed_rank").fill_null(EMBED_RANK_MISSING).cast(pl.Float32) if "embed_rank" in out.columns
+        else pl.lit(EMBED_RANK_MISSING, dtype=pl.Float32).alias("embed_rank"),
     )
     if labels is not None:
         out = out.join(labels, on=["source1_entity_id", "candidate_entity_id"], how="left") \
@@ -263,7 +263,7 @@ def featurise_split(
     embed_all = _load_embed_scores(split, in_dir)
     labels_all = _true_pairs(in_dir).collect() if split == "train" else None
     if verbose:
-        print(f"  embed_ann: {'joined from embed_ann_pairs.parquet' if embed_all is not None else 'no precomputed scores found, embed_cosine/rank = 0'}")
+        print(f"  embed_ann: {'joined from embed_ann_pairs.parquet' if embed_all is not None else 'no precomputed scores found, embed_cosine = 0, embed_rank = 9999 (missing)'}")
 
     t0 = time.perf_counter()
     rows = positives = 0
