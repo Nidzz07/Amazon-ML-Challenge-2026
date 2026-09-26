@@ -96,6 +96,11 @@ def run(dataset_dir: Path, artifacts_dir: Path, check_counts: bool, raw_path_fn=
             raw = raw_path_fn(split, src, dataset_dir)
             out = config.records_path(split, src, artifacts_dir)
             expected = config.EXPECTED_ROWS[(split, src)] if check_counts else None
+            if not raw.exists():
+                if not check_counts:
+                    print(f"skipping {raw.name} (not found)", flush=True)
+                    continue
+                raise FileNotFoundError(f"{raw} is required but missing")
             print(f"ingesting {raw.name} ...", flush=True)
             results.append(ingest_file(split, src, raw, out, expected))
     return results

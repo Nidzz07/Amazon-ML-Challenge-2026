@@ -104,6 +104,9 @@ def main(argv=None) -> None:
     in_dir, out_dir = pio.dirs(args)
     t0 = time.perf_counter()
     for split in config.SPLITS:
+        if not config.norm_path(split, config.SOURCE1_SRC, in_dir).exists():
+            print(f"  skipping {split} (norm_{split}_source1.parquet not found)")
+            continue
         cands, uncapped, _ = block(split, in_dir)
         pio.check_schema(cands, pio.CANDIDATES_SCHEMA, f"candidates_{split}")
         out = config.candidates_path(split, out_dir)
