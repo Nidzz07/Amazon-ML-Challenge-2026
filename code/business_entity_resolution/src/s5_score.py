@@ -106,7 +106,7 @@ def main(argv=None) -> None:
 
     model, calibrator, meta = load_model_and_calibrator(in_dir)
     feature_names, _ = pio.feature_spec()
-    feature_cols = list(feature_names)
+    feature_cols = pio.feature_columns(len(feature_names))
     is_stub = meta.get("kind") == "stub"
 
     for split in config.SPLITS:

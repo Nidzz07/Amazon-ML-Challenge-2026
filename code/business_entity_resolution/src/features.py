@@ -6,11 +6,10 @@ FEATURE_VERSION = 1
 # -1 = strictly decreasing
 # 0 = unconstrained
 FEATURE_NAMES = [
-    ("name_rapidfuzz_ratio", 1),
-    ("addr_rapidfuzz_ratio", 1),
-    ("rank_in_entity", -1), 
-    ("n_channels", 1),
-    ("prior_score", 1),
+    "prior_score",
+    "n_channels",
+    "best_rank", 
+    "is_source3",
 ]
 
 def featurise(s1_rows, cand_rows, context):

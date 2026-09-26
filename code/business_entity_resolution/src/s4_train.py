@@ -78,9 +78,13 @@ def _entity_split(df: pl.DataFrame, val_frac: float, calib_frac: float, seed: in
     return train, val, calib
 
 
-def _sample_negatives(df: pl.DataFrame, n_pos: int, ratio: float, seed: int) -> pl.DataFrame:
+def _sample_negatives(df: pl.DataFrame, n_pos: int, ratio: float, seed: int, feature_names: tuple[str, ...]) -> pl.DataFrame:
     """Keep all positives; sample hard negatives (top prior_score) at ratio:1."""
-    neg = df.filter(pl.col("label") == 0).sort("prior_score", descending=True)
+    if "prior_score" in feature_names:
+        score_col = f"f{feature_names.index('prior_score'):03d}"
+    else:
+        score_col = "f000"
+    neg = df.filter(pl.col("label") == 0).sort(score_col, descending=True)
     target = int(n_pos * ratio)
     if len(neg) > target:
         neg = neg.head(target)
@@ -96,7 +100,7 @@ def main(argv=None) -> None:
     t0 = time.perf_counter()
 
     feature_names, feature_version = pio.feature_spec()
-    feature_cols = list(feature_names)
+    feature_cols = pio.feature_columns(len(feature_names))
     print(f"Feature version: {feature_version}  |  {len(feature_cols)} features")
 
     # ── 1. Load features + labels ─────────────────────────────────────────
@@ -120,7 +124,7 @@ def main(argv=None) -> None:
 
     # ── 3. Hard-negative sampling ─────────────────────────────────────────
     pos = df.filter(pl.col("label") == 1)
-    neg = _sample_negatives(df, len(pos), args.neg_ratio, config.SEED)
+    neg = _sample_negatives(df, len(pos), args.neg_ratio, config.SEED, feature_names)
     df = pl.concat([pos, neg])
     print(f"  After neg sampling ({args.neg_ratio:.1f}:1): {len(df):,} rows  "
           f"({len(pos):,} pos / {len(neg):,} neg)")
@@ -133,8 +137,8 @@ def main(argv=None) -> None:
     # Monotonic constraints: +1 for similarity/channel features, 0 for unconstrained.
     # When Krrish's features.py exposes monotone directions, read them here.
     try:
-        from features import FEATURE_NAMES as FN_FULL
-        mono = [d for _, d in FN_FULL]
+        from features import FEATURE_MONOTONES
+        mono = FEATURE_MONOTONES
     except ImportError:
         mono = [0] * len(feature_cols)
 
@@ -179,7 +183,7 @@ def main(argv=None) -> None:
     meta = {
         "kind": "lightgbm",
         "feature_version": feature_version,
-        "feature_names": feature_cols,
+        "feature_names": list(feature_names),
         "best_iteration": model.best_iteration,
         "train_rows": len(train_df),
         "pos_rate": float(train_df["label"].mean()),
