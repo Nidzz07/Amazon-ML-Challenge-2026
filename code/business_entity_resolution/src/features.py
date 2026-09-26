@@ -126,12 +126,15 @@ FEATURE_SPEC: list[tuple[str, int]] = [
     ("cand_is_argmax",     1),
     # ── Embedding ANN features (2) — Tanuj, B5 ──────────────────────
     ("embed_cosine",       1),   # cosine similarity from FAISS search (0 if not in ANN)
-    ("embed_rank",        -1),   # rank within entity in ANN channel (0 if not in ANN)
+    ("embed_rank",        -1),   # rank within entity in ANN channel (EMBED_RANK_MISSING = 9999 if not in ANN)
 ]
 
 FEATURE_NAMES: tuple[str, ...] = tuple(n for n, _ in FEATURE_SPEC)
 FEATURE_MONO: tuple[int, ...] = tuple(d for _, d in FEATURE_SPEC)
-FEATURE_VERSION: int = 2
+FEATURE_VERSION: int = 3   # v3: embed_rank fill for "not in ANN" changed 0 -> EMBED_RANK_MISSING (values, not names)
+# embed_rank is monotone -1 (lower rank = better), so a pair absent from the ANN search must read as WORSE than any
+# real rank. Filling 0 made it read as better than rank 1. Used by s3_featurise._join_block and featurise().
+EMBED_RANK_MISSING: float = 9999.0
 NUM_FEATURES: int = len(FEATURE_NAMES)
 
 # Channel bit positions (must match config.CHANNELS order)
@@ -242,10 +245,10 @@ def _tok_col(pairs: "pl.DataFrame", name: str) -> pl.Series:
     return pairs[name].fill_null([])
 
 
-def _np_col(pairs: "pl.DataFrame", name: str, dtype=np.float32) -> np.ndarray:
+def _np_col(pairs: "pl.DataFrame", name: str, dtype=np.float32, fill: float = 0) -> np.ndarray:
     if name not in pairs.columns:
-        return np.zeros(pairs.height, dtype=dtype)
-    return pairs[name].fill_null(0).to_numpy().astype(dtype)
+        return np.full(pairs.height, fill, dtype=dtype)
+    return pairs[name].fill_null(fill).to_numpy().astype(dtype)
 
 
 def _nonempty_both(a: pl.Series, b: pl.Series) -> np.ndarray:
@@ -734,7 +737,7 @@ def featurise(pairs: "pl.DataFrame") -> np.ndarray:
     # ── Embedding ANN features (2) — Tanuj, B5 ──────────────────────
     embed = np.zeros((n, 2), dtype=np.float32)
     embed[:, 0] = _np_col(pairs, "embed_cosine")   # 0.0 if pair not in ANN output
-    embed[:, 1] = _np_col(pairs, "embed_rank")     # 0.0 if pair not in ANN output
+    embed[:, 1] = _np_col(pairs, "embed_rank", fill=EMBED_RANK_MISSING)  # sentinel if pair not in ANN output
     blocks.append(embed)
 
     result = np.hstack(blocks)
