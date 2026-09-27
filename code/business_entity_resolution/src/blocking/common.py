@@ -12,6 +12,10 @@ Document-frequency ceilings (config.TFIDF_MAX_DF, config.RARE_TOKEN_DF_MAX) go
 through resolve_df when the channel builds its index, so a fraction becomes a count
 against the shard actually being indexed.
 """
+import os
+from pathlib import Path
+from typing import Iterable
+
 import polars as pl
 
 CHANNEL_SCHEMA = {
@@ -24,6 +28,34 @@ CHANNEL_SCHEMA = {
 
 def empty() -> pl.DataFrame:
     return pl.DataFrame(schema=CHANNEL_SCHEMA)
+
+
+def stream_to_parquet(parts: Iterable[pl.DataFrame], path: Path, bit: int) -> tuple[int, int]:
+    """Writes CHANNEL_SCHEMA frames, plus a constant `bit` column, to parquet at `path` one
+    frame at a time (tmp file + rename), so a channel's whole output never sits in memory.
+    Returns (rows, distinct source1 entities), counting entities per frame: callers pass
+    frames whose entities are disjoint (one hash bucket / chunk of entities each)."""
+    import pyarrow.parquet as pq
+
+    tmp = path.with_name(path.name + ".tmp")
+    writer, n_rows, n_ents = None, 0, 0
+    try:
+        for part in parts:
+            table = part.with_columns(pl.lit(bit, dtype=pl.UInt8).alias("bit")).to_arrow(
+                compat_level=pl.CompatLevel.oldest())
+            if writer is None:
+                writer = pq.ParquetWriter(tmp, table.schema)
+            writer.write_table(table)
+            n_rows += part.height
+            n_ents += part["source1_entity_id"].n_unique()
+            del part, table
+    finally:
+        if writer is not None:
+            writer.close()
+    if writer is None:
+        empty().with_columns(pl.lit(bit, dtype=pl.UInt8).alias("bit")).write_parquet(tmp)
+    os.replace(tmp, path)
+    return n_rows, n_ents
 
 
 # Ceilings resolved since the last pop_resolved(); s2_block attaches them to its

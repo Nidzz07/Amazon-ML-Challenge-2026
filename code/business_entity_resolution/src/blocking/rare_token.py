@@ -18,11 +18,18 @@ tokens are never materialised as one frame. Token dedup is per record and df cou
 distinct records, so both are computed per slice of config.RARE_TOKEN_SLICE_ROWS pool
 records (pass 1: df, summed; pass 2: postings of in-range tokens only). Same output as
 one pass, given unique pool entity_ids, which run() asserts.
+
+run_to_file() is what s2's checkpointed path uses: each chunk's final rows go straight
+into the part file instead of accumulating until one concat (full India climbed ~0.5 GB
+a minute; France jumped +2.35 GB at the concat). Rows keep chunk order, which is entity
+order, but the file is written in row groups; the union does not depend on row order.
 """
+from pathlib import Path
+
 import polars as pl
 
 import config
-from blocking.common import empty, rank_within_entity, resolve_df
+from blocking.common import empty, rank_within_entity, resolve_df, stream_to_parquet
 
 NAME = "rare_token"
 # The only norm columns run() reads; s2_block loads just these. s1.height + pool.height
@@ -49,7 +56,8 @@ def _pool_slices(pool: pl.DataFrame):
         yield _tokens(pool.slice(off, step))
 
 
-def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFrame:
+def _ranked_chunks(s1: pl.DataFrame, pool: pl.DataFrame):
+    """Final rows, one chunk of RARE_TOKEN_CHUNK_ROWS Source-1 entities at a time."""
     df_max = resolve_df("RARE_TOKEN_DF_MAX", config.RARE_TOKEN_DF_MAX, s1.height + pool.height)
     if config.RARE_TOKEN_DF_MAX_ABS is not None and (df_max is None or df_max > config.RARE_TOKEN_DF_MAX_ABS):
         print(f"    RARE_TOKEN_DF_MAX_ABS caps it at {config.RARE_TOKEN_DF_MAX_ABS:,}")
@@ -79,7 +87,6 @@ def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFra
     del posts
 
     ids = rarest["source1_entity_id"].unique(maintain_order=True)
-    parts = []
     for start in range(0, len(ids), config.RARE_TOKEN_CHUNK_ROWS):
         chunk = rarest.filter(pl.col("source1_entity_id").is_in(ids.slice(start, config.RARE_TOKEN_CHUNK_ROWS).implode()))
         pairs = (
@@ -89,5 +96,18 @@ def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFra
         )
         # Entities never span chunks, so ranking and capping per chunk is exact.
         ranked = rank_within_entity(pairs, ["shared", "min_df"], [True, False], "shared")
-        parts.append(ranked.filter(pl.col("channel_rank") <= config.RARE_TOKEN_TOP_K))
+        del pairs
+        yield ranked.filter(pl.col("channel_rank") <= config.RARE_TOKEN_TOP_K)
+
+
+def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFrame:
+    """In memory; the cap sweep and tests use this."""
+    parts = list(_ranked_chunks(s1, pool))
     return pl.concat(parts) if parts else empty()
+
+
+def run_to_file(s1: pl.DataFrame, pool: pl.DataFrame, path: Path, bit: int, smoke: bool = False) -> tuple[int, int]:
+    """Streams run()'s rows, plus the channel's `bit` column, chunk by chunk into parquet at
+    `path`. Returns (pairs, entities). Pairs are unique: each chunk's group_by makes them
+    unique and entities never span chunks."""
+    return stream_to_parquet(_ranked_chunks(s1, pool), path, bit)

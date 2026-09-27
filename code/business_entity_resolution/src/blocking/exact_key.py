@@ -22,13 +22,12 @@ into the part file, so peak memory no longer scales with the channel's TOTAL out
 entity; the union does not depend on row order within a part (each pair appears once
 per channel and is summed in channel order), and candidates are unchanged.
 """
-import os
 from pathlib import Path
 
 import polars as pl
 
 import config
-from blocking.common import empty, rank_within_entity
+from blocking.common import empty, rank_within_entity, stream_to_parquet
 
 NAME = "exact_key"
 # The only norm columns run() reads (every family's key columns); s2_block loads just these.
@@ -93,24 +92,4 @@ def run_to_file(s1: pl.DataFrame, pool: pl.DataFrame, path: Path, bit: int, smok
     at `path` (tmp file + rename). Returns (pairs, entities). Rows are unique per pair:
     each bucket's group_by makes its pairs unique and every entity lives in exactly one
     bucket, so no whole-output uniqueness check is needed."""
-    import pyarrow.parquet as pq
-
-    tmp = path.with_name(path.name + ".tmp")
-    writer, n_pairs, n_ents = None, 0, 0
-    try:
-        for part in _ranked_buckets(s1, pool, config.EXACT_KEY_FAMILIES):
-            table = part.with_columns(pl.lit(bit, dtype=pl.UInt8).alias("bit")).to_arrow(
-                compat_level=pl.CompatLevel.oldest())
-            if writer is None:
-                writer = pq.ParquetWriter(tmp, table.schema)
-            writer.write_table(table)
-            n_pairs += part.height
-            n_ents += part["source1_entity_id"].n_unique()
-            del part, table
-    finally:
-        if writer is not None:
-            writer.close()
-    if writer is None:
-        empty().with_columns(pl.lit(bit, dtype=pl.UInt8).alias("bit")).write_parquet(tmp)
-    os.replace(tmp, path)
-    return n_pairs, n_ents
+    return stream_to_parquet(_ranked_buckets(s1, pool, config.EXACT_KEY_FAMILIES), path, bit)
