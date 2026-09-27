@@ -70,3 +70,28 @@ def test_isotonic_on_unsampled_slice_recovers_real_prevalence():
     new_err = abs(ir.transform(score).mean() - y.mean())
     assert old_err > 0.02                                               # reads high (~+30% here; worse when the score is less separable)
     assert new_err < old_err / 5
+
+
+def test_reliability_table_bins_and_calibrated_data_reads_straight():
+    rng = np.random.default_rng(3)
+    n = 300_000
+    p_true = rng.uniform(0, 1, n)
+    y = (rng.random(n) < p_true).astype(np.uint8)                       # perfectly calibrated by construction
+    rows = s4.reliability_table(y, p_true)
+    assert sum(r["n"] for r in rows) == n and len(rows) == 10
+    assert all(abs(r["mean_pred"] - r["observed"]) < 0.01 for r in rows)
+    near = s4.reliability_table(y, p_true, [0.65, 0.75])
+    assert len(near) == 1 and 0.65 <= near[0]["mean_pred"] <= 0.75 and abs(near[0]["mean_pred"] - near[0]["observed"]) < 0.01
+
+
+def test_fit_isotonic_reports_cross_fitted_reliability():
+    rng = np.random.default_rng(4)
+    n = 120_000
+    y = (rng.random(n) < 0.115).astype(np.uint8)
+    score = np.clip(0.5 * y + rng.normal(0.25, 0.15, n), 0, 1)
+    bucket = rng.integers(0, 100, n).astype(np.uint8)
+    _, stats = s4.fit_isotonic_with_check(score, y, bucket)
+    assert sum(r["n"] for r in stats["reliability"]) == n               # every row scored by a calibrator that never saw it
+    hi = [r for r in stats["reliability"] if r["mean_pred"] > 0.6]
+    assert hi and all(abs(r["mean_pred"] - r["observed"]) < 0.1 for r in hi)
+    assert stats["near_0_7"] is None or 0.65 <= stats["near_0_7"]["mean_pred"] <= 0.75
