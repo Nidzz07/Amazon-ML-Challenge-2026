@@ -36,6 +36,7 @@ Usage:
                        [--channels name_tfidf addr_tfidf ...] [--train-entities N | --no-train-subsample]
 """
 import importlib
+import inspect
 import json
 import os
 import shutil
@@ -44,10 +45,11 @@ import time
 from pathlib import Path
 
 import polars as pl
+import pyarrow.parquet as pq
 
 import config
 import pipeline_io as pio
-from blocking.common import CHANNEL_SCHEMA, pop_notes, pop_resolved
+from blocking.common import CHANNEL_SCHEMA, empty, pop_notes, pop_resolved
 
 CHANNEL_MODULES = {name: importlib.import_module(f"blocking.{name}") for name in config.CHANNELS}
 assert all(m.NAME == n for n, m in CHANNEL_MODULES.items())
@@ -125,6 +127,50 @@ def run_channel(split: str, country: str, bit: int, name: str, module, s1: pl.Da
     if verbose:
         print(f"  {name:<11} {row['pairs']:>10,} pairs  {row['entities']:>8,} entities  {sec:6.1f}s", flush=True)
     return out.with_columns(pl.lit(1 << bit, dtype=pl.UInt8).alias("bit")), row
+
+
+def channel_supports_streaming(module) -> bool:
+    """True if module.run() takes `sink` -- i.e. it can write its own output incrementally instead of
+    returning one big DataFrame (see exact_key.py / rare_token.py). TF-IDF and embed_ann don't need it
+    and are untouched; this just detects the ones that do."""
+    return "sink" in inspect.signature(module.run).parameters
+
+
+def run_channel_to_disk(split: str, country: str, bit: int, name: str, module, s1: pl.DataFrame,
+                        pool: pl.DataFrame, smoke: bool, path: Path) -> dict:
+    """Same contract as run_channel + write_atomic combined, for a channel whose run() supports `sink`:
+    each internal chunk is checked, tagged with `bit`, and written straight to `path` (tmp-then-rename,
+    same as write_atomic) as soon as it is produced. Peak memory for this channel is one chunk's pairs,
+    never the whole channel's -- see the note in exact_key.run()/rare_token.run() for why that matters
+    at full scale. Stats are accumulated across chunks so the printed line/report entry is unchanged."""
+    pop_resolved()
+    pop_notes()
+    t0 = time.perf_counter()
+    tmp = path.with_name(path.name + ".tmp")
+    state = {"writer": None, "pairs": 0, "entities": set()}
+
+    def sink(chunk: pl.DataFrame) -> None:
+        pio.check_schema(chunk, CHANNEL_SCHEMA, f"{name} output")
+        assert chunk.select(pl.struct("source1_entity_id", "candidate_entity_id").is_unique().all()).item(), name
+        chunk = chunk.with_columns(pl.lit(1 << bit, dtype=pl.UInt8).alias("bit"))
+        table = chunk.to_arrow()
+        if state["writer"] is None:
+            state["writer"] = pq.ParquetWriter(str(tmp), table.schema)
+        state["writer"].write_table(table)
+        state["pairs"] += chunk.height
+        state["entities"].update(chunk["source1_entity_id"].to_list())
+
+    module.run(s1, pool, smoke=smoke, sink=sink)
+    if state["writer"] is not None:
+        state["writer"].close()
+        os.replace(tmp, path)
+    else:
+        write_atomic(empty().with_columns(pl.lit(1 << bit, dtype=pl.UInt8).alias("bit")), path)
+    sec = time.perf_counter() - t0
+    row = {"split": split, "country": country, "channel": name, "pairs": state["pairs"],
+          "entities": len(state["entities"]), "sec": sec, "resolved": pop_resolved(), "notes": pop_notes()}
+    print(f"  {name:<11} {row['pairs']:>10,} pairs  {row['entities']:>8,} entities  {sec:6.1f}s (streamed)", flush=True)
+    return row
 
 
 def union(long: pl.DataFrame) -> pl.DataFrame:
@@ -279,10 +325,13 @@ def block_checkpointed(split: str, in_dir, out_dir, s1_ids: pl.Series | None, sm
                 if name not in todo:
                     continue
                 s1, pool = load_shard(split, in_dir, country, s1_ids, module.COLUMNS)
-                out, _ = run_channel(split, country, bit, name, module, s1, pool, smoke, True)
+                if channel_supports_streaming(module):
+                    run_channel_to_disk(split, country, bit, name, module, s1, pool, smoke, part(country, name))
+                else:
+                    out, _ = run_channel(split, country, bit, name, module, s1, pool, smoke, True)
+                    write_atomic(out, part(country, name))
+                    del out
                 del s1, pool
-                write_atomic(out, part(country, name))
-                del out
 
         stale = [n for n in config.CHANNELS if have["channels"].get(n) != manifest_channel(n, smoke)]
         missing = sorted({f"{c}_{n}" for c in countries for n in config.CHANNELS if not part(c, n).exists()})

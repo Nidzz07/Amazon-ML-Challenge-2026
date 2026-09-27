@@ -49,7 +49,7 @@ def _pool_slices(pool: pl.DataFrame):
         yield _tokens(pool.slice(off, step))
 
 
-def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFrame:
+def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False, sink=None) -> pl.DataFrame | None:
     df_max = resolve_df("RARE_TOKEN_DF_MAX", config.RARE_TOKEN_DF_MAX, s1.height + pool.height)
     if config.RARE_TOKEN_DF_MAX_ABS is not None and (df_max is None or df_max > config.RARE_TOKEN_DF_MAX_ABS):
         print(f"    RARE_TOKEN_DF_MAX_ABS caps it at {config.RARE_TOKEN_DF_MAX_ABS:,}")
@@ -78,8 +78,12 @@ def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFra
     postings = (pl.concat(posts) if posts else _tokens(pool)).rename({"entity_id": "candidate_entity_id"})
     del posts
 
+    # sink (see exact_key.run): entities never span chunks, so a chunk's ranking/capping/dedup is exact
+    # on its own and needs nothing from any other chunk -- as with exact_key, holding every chunk's rows
+    # until one final concat is itself a large allocation once total kept pairs run into the hundreds of
+    # millions, on top of whatever the join/group_by needed for one chunk.
     ids = rarest["source1_entity_id"].unique(maintain_order=True)
-    parts = []
+    parts = None if sink is not None else []
     for start in range(0, len(ids), config.RARE_TOKEN_CHUNK_ROWS):
         chunk = rarest.filter(pl.col("source1_entity_id").is_in(ids.slice(start, config.RARE_TOKEN_CHUNK_ROWS).implode()))
         pairs = (
@@ -89,5 +93,13 @@ def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFra
         )
         # Entities never span chunks, so ranking and capping per chunk is exact.
         ranked = rank_within_entity(pairs, ["shared", "min_df"], [True, False], "shared")
-        parts.append(ranked.filter(pl.col("channel_rank") <= config.RARE_TOKEN_TOP_K))
+        ranked = ranked.filter(pl.col("channel_rank") <= config.RARE_TOKEN_TOP_K)
+        del pairs
+        if sink is not None:
+            sink(ranked)
+            del ranked
+        else:
+            parts.append(ranked)
+    if sink is not None:
+        return None
     return pl.concat(parts) if parts else empty()
