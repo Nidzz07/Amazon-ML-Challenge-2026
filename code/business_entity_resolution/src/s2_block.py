@@ -127,6 +127,21 @@ def run_channel(split: str, country: str, bit: int, name: str, module, s1: pl.Da
     return out.with_columns(pl.lit(1 << bit, dtype=pl.UInt8).alias("bit")), row
 
 
+def run_channel_to_file(split: str, country: str, bit: int, name: str, module, s1: pl.DataFrame,
+                        pool: pl.DataFrame, smoke: bool, path: Path) -> None:
+    """Like run_channel + write_atomic, for channels whose output is too large to hold
+    (module.run_to_file streams it into `path`). Checks the written file's schema."""
+    pop_resolved()
+    pop_notes()
+    t0 = time.perf_counter()
+    n_pairs, n_ents = module.run_to_file(s1, pool, path, 1 << bit, smoke=smoke)
+    sec = time.perf_counter() - t0
+    got = dict(pl.read_parquet_schema(path))
+    want = {**CHANNEL_SCHEMA, "bit": pl.UInt8}
+    assert got == want, f"{name} part {path.name}: schema {got} != {want}"
+    print(f"  {name:<11} {n_pairs:>10,} pairs  {n_ents:>8,} entities  {sec:6.1f}s  (streamed)", flush=True)
+
+
 def union(long: pl.DataFrame) -> pl.DataFrame:
     """One row per pair in the candidates schema, uncapped."""
     return long.lazy().group_by("source1_entity_id", "candidate_entity_id").agg(
@@ -260,7 +275,9 @@ def block_checkpointed(split: str, in_dir, out_dir, s1_ids: pl.Series | None, sm
         for name in channels:
             want = manifest_channel(name, smoke)
             if resume and have["channels"].get(name) == want:
-                print(f"[{split}] {name}: reusing finished parts", flush=True)
+                n_have = sum(part(c, name).exists() for c in countries)
+                print(f"[{split}] {name}: settings unchanged; {n_have} of {len(countries)} country parts "
+                      f"already finished, computing the other {len(countries) - n_have}", flush=True)
             else:
                 why = "--resume but its settings changed" if resume and name in have["channels"] else "recomputing"
                 print(f"[{split}] {name}: {why}", flush=True)
@@ -279,6 +296,10 @@ def block_checkpointed(split: str, in_dir, out_dir, s1_ids: pl.Series | None, sm
                 if name not in todo:
                     continue
                 s1, pool = load_shard(split, in_dir, country, s1_ids, module.COLUMNS)
+                if hasattr(module, "run_to_file"):  # output too large to hold: streamed to the part
+                    run_channel_to_file(split, country, bit, name, module, s1, pool, smoke, part(country, name))
+                    del s1, pool
+                    continue
                 out, _ = run_channel(split, country, bit, name, module, s1, pool, smoke, True)
                 del s1, pool
                 write_atomic(out, part(country, name))
