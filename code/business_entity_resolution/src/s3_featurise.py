@@ -171,20 +171,34 @@ def _add_context_and_competition(cands: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _load_embed_scores(split: str, in_dir) -> pl.DataFrame | None:
-    """Load precomputed embedding cosine scores if available."""
+def _load_embed_scores(split: str, in_dir) -> pl.LazyFrame | None:
+    """Lazy handle on the precomputed embedding scores for `split`; nothing is read until a shard collects
+    it (see _embed_for_shard). The full-scale file has ~79M rows, and reading it whole cost several GB per split."""
     embed_path = Path(in_dir) / "embed_ann_pairs.parquet"
     if not embed_path.exists():
         return None
-    df = pl.read_parquet(embed_path)
-    # Filter to the requested split if split column exists
-    if "split" in df.columns:
-        df = df.filter(pl.col("split") == split)
-    return df.select(
-        "source1_entity_id", "candidate_entity_id",
-        pl.col("channel_score").alias("embed_cosine"),
-        pl.col("channel_rank").cast(pl.Float32).alias("embed_rank"),
-    )
+    lf = pl.scan_parquet(embed_path)
+    names = lf.collect_schema().names()
+    if "split" in names:  # older files without the column hold a single split
+        lf = lf.filter(pl.col("split") == split)
+    keep = ["source1_entity_id", "candidate_entity_id",
+            pl.col("channel_score").alias("embed_cosine"),
+            pl.col("channel_rank").cast(pl.Float32).alias("embed_rank")]
+    if "country" in names:
+        keep.append("country")
+    return lf.select(keep)
+
+
+def _embed_for_shard(embed_all: pl.LazyFrame | None, country: str, s1_ids: pl.Series) -> pl.DataFrame | None:
+    """This shard's embedding rows only. The file is written per (split, country), so the country filter lets
+    parquet skip every other shard's row groups; the id filter is the same restriction the old code applied."""
+    if embed_all is None:
+        return None
+    lf = embed_all
+    if "country" in lf.collect_schema().names():
+        lf = lf.filter(pl.col("country") == country).drop("country")
+    return lf.filter(pl.col("source1_entity_id").is_in(s1_ids.implode())).collect(engine="streaming")
+
 
 
 def _join_block(
@@ -289,10 +303,7 @@ def featurise_split(
 
             # Restrict the two pair-keyed side tables to this shard, so the
             # per-block joins never probe the other countries' rows.
-            embed = (
-                embed_all.filter(pl.col("source1_entity_id").is_in(s1_ids.implode()))
-                if embed_all is not None else None
-            )
+            embed = _embed_for_shard(embed_all, country, s1_ids)
             labels = (
                 labels_all.filter(pl.col("source1_entity_id").is_in(s1_ids.implode()))
                 if labels_all is not None else None

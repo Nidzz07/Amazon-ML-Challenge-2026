@@ -1,19 +1,24 @@
+# Core pipeline (S0-S7). Versions below are the ones the pipeline was run and tested with.
+# Python: developed on 3.13.9 (Windows 11); the Kaggle embedding run used 3.12. NOT tested on 3.11.
+# GPU embedding stage (s2a_embed.py) needs extra packages: see requirements-embed.txt
 polars==1.44.2
 pyarrow==25.0.1
-pandas==3.0.6
 numpy==2.4.6
 scipy==1.17.1
 scikit-learn==1.9.1
 lightgbm==4.7.0
 rapidfuzz==3.14.6
 jellyfish==1.2.1
-python-Levenshtein==0.27.5
 indic-transliteration==2.3.82
-aksharamukha==2.3
 regex==2026.9.10
-unidecode==1.4.0
-faiss-cpu==1.15.1
 sparse-dot-topn==1.2.0
 tqdm==4.70.1
-orjson==3.12.0
+psutil==7.1.1
 pytest==9.1.1
+# Pinned in the original list but not imported anywhere under src/ (checked 2026-09-27); kept so the
+# environment matches what was installed. Safe to drop once confirmed by the owner.
+pandas==3.0.6
+python-Levenshtein==0.27.5
+aksharamukha==2.3
+unidecode==1.4.0
+orjson==3.12.0

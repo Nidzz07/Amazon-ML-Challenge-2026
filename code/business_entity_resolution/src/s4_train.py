@@ -182,16 +182,32 @@ def ece(y: np.ndarray, p: np.ndarray, bins: int = 10) -> float:
     return total / len(y)
 
 
+def reliability_table(y: np.ndarray, p: np.ndarray, edges=None) -> list[dict]:
+    """Per probability bin: rows, mean predicted, observed match rate. Empty bins are omitted."""
+    edges = np.linspace(0.0, 1.0, 11) if edges is None else np.asarray(edges)
+    which = np.digitize(p, edges) - 1                    # bins are [lo, hi); the top edge itself joins the last bin
+    which[p == edges[-1]] = len(edges) - 2
+    out = []
+    for b in range(len(edges) - 1):
+        m = which == b                                   # values outside [edges[0], edges[-1]] fall in no bin
+        if m.any():
+            out.append({"lo": float(edges[b]), "hi": float(edges[b + 1]), "n": int(m.sum()),
+                        "mean_pred": float(p[m].mean()), "observed": float(y[m].mean())})
+    return out
+
+
 def fit_isotonic_with_check(raw: np.ndarray, y: np.ndarray, bucket: np.ndarray):
     """Final isotonic fit on all calib rows, plus an honest 2-fold entity-level check (fit on one half of the
     calib entities, score the other) because fitting and scoring on the same rows flatters isotonic."""
     fold = (bucket % 2).astype(bool)
     cv = []
+    p_cv = np.full(len(raw), np.nan)                       # every row scored by a calibrator that never saw its entity
     for train_mask in (fold, ~fold):
         if train_mask.sum() == 0 or (~train_mask).sum() == 0:
             continue
         ir = IsotonicRegression(out_of_bounds="clip").fit(raw[train_mask], y[train_mask])
         p = ir.transform(raw[~train_mask])
+        p_cv[~train_mask] = p
         cv.append((brier_score_loss(y[~train_mask], p), ece(y[~train_mask], p)))
     final = IsotonicRegression(out_of_bounds="clip").fit(raw, y)
     stats = {
@@ -203,6 +219,11 @@ def fit_isotonic_with_check(raw: np.ndarray, y: np.ndarray, bucket: np.ndarray):
         "brier_cv": float(np.mean([c[0] for c in cv])) if cv else None,
         "ece_cv": float(np.mean([c[1] for c in cv])) if cv else None,
     }
+    ok = ~np.isnan(p_cv)
+    if ok.any():
+        # cross-fitted, so this is an honest read of "when we say 0.7, how often is it a match?"
+        stats["reliability"] = reliability_table(y[ok], p_cv[ok])
+        stats["near_0_7"] = next(iter(reliability_table(y[ok], p_cv[ok], [0.65, 0.75])), None)
     return final, stats
 
 
@@ -220,6 +241,21 @@ def monotone_constraints(n_features: int) -> list[int]:
     return mono
 
 
+def print_reliability(cal: dict) -> None:
+    """Cross-fitted reliability table; the 0.65-0.75 bin is the one the selection layer leans on."""
+    if not cal.get("reliability"):
+        return
+    print("  reliability (cross-fitted calibrated prob vs observed match rate):")
+    print(f"    {'bin':>11s} {'rows':>10s} {'mean pred':>10s} {'observed':>9s}")
+    for r in cal["reliability"]:
+        print(f"    {r['lo']:4.2f}-{r['hi']:4.2f} {r['n']:>10,} {r['mean_pred']:>10.3f} {r['observed']:>9.3f}")
+    b = cal.get("near_0_7")
+    if b:
+        print(f"  near 0.7 (0.65-0.75): {b['n']:,} rows, mean pred {b['mean_pred']:.3f}, observed {b['observed']:.3f}")
+    else:
+        print("  near 0.7 (0.65-0.75): no rows fall in this bin")
+
+
 # ── France proxy: train on one country, evaluate on the other ────────────────
 def transfer_test(path, in_dir, feature_cols, prior_col, held_out, args, mono) -> None:
     s1 = pl.read_parquet(config.records_path("train", config.SOURCE1_SRC, in_dir), columns=["entity_id", "country"])
@@ -229,6 +265,8 @@ def transfer_test(path, in_dir, feature_cols, prior_col, held_out, args, mono) -
     for df in iter_entity_batches(path, [ID, "label", *feature_cols], args.batch_rows):
         if held_out is not None:
             df = df.filter(~pl.col(ID).is_in(held_out.implode()))
+        if args.transfer_frac < 1.0:      # keep RAM bounded at full scale: a stable slice of entities is plenty for a proxy
+            df = df.filter(pl.Series(entity_bucket(df[ID]) < round(args.transfer_frac * 100)))
         df = df.join(s1, on=ID, how="left")
         for c in countries:
             part = df.filter(pl.col("country") == c)
@@ -252,6 +290,37 @@ def transfer_test(path, in_dir, feature_cols, prior_col, held_out, args, mono) -
         for name, (X, y) in ((f"{src} (held)", (Xs[hold], ys[hold])), (dst, data[dst][:2])):
             p = m.predict(X)
             print(f"  {src:6s} {name:12s} {roc_auc_score(y, p):7.4f} {brier_score_loss(y, p):8.5f}")
+    if not args.no_country_variant:
+        country_variant(data, params, feature_cols, args.transfer_rounds)
+
+
+def country_variant(data: dict, params: dict, feature_cols: list[str], rounds: int) -> None:
+    """Does a country feature help at all? Train one US+India model without it and one with it, and score both on
+    held-out ENTITIES of each country. France has no training data, so a country feature can never be learned for it;
+    if it buys little in-distribution, the country-blind model is the safer choice."""
+    (Xu, yu, bu), (Xi, yi, bi) = data["US"], data["India"]
+    X, y, b = np.concatenate([Xu, Xi]), np.concatenate([yu, yi]), np.concatenate([bu, bi])
+    is_india = np.concatenate([np.zeros(len(yu), dtype=bool), np.ones(len(yi), dtype=bool)])
+    hold = b % 5 == 0
+    print(f"\n  Country feature (US+India model, {int((~hold).sum()):,} train rows; eval on held-out entities)")
+    print(f"  {'model':14s} {'eval':6s} {'AUC':>7s} {'Brier':>8s}")
+    results = {}
+    for name, mat, names, mono in (("country-blind", X, feature_cols, params["monotone_constraints"]),
+                                   ("country-aware", None, [*feature_cols, "country_is_india"],
+                                    [*params["monotone_constraints"], 0])):
+        if mat is None:
+            mat = np.column_stack([X, is_india.astype(np.float32)]).astype(np.float32)
+        m = lgb.train({**params, "monotone_constraints": mono},
+                      lgb.Dataset(mat[~hold], label=y[~hold], feature_name=names), num_boost_round=rounds)
+        for cname, mask in (("US", ~is_india), ("India", is_india)):
+            sel = hold & mask
+            p = m.predict(mat[sel])
+            results[(name, cname)] = (roc_auc_score(y[sel], p), brier_score_loss(y[sel], p))
+            print(f"  {name:14s} {cname:6s} {results[(name, cname)][0]:7.4f} {results[(name, cname)][1]:8.5f}")
+        del mat
+    for cname in ("US", "India"):
+        da = results[("country-aware", cname)][0] - results[("country-blind", cname)][0]
+        print(f"  AUC gain from the country feature on {cname}: {da:+.4f}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -266,6 +335,8 @@ def main(argv=None) -> None:
     ap.add_argument("--early-stop", type=int, default=LGB_EARLY_STOP)
     ap.add_argument("--transfer-test", action="store_true", help="France proxy: US -> India and India -> US, then exit")
     ap.add_argument("--transfer-rounds", type=int, default=100)
+    ap.add_argument("--transfer-frac", type=float, default=0.25, help="share of entities (by hash) used by --transfer-test")
+    ap.add_argument("--no-country-variant", action="store_true", help="skip the country-blind vs country-aware comparison")
     args = ap.parse_args(argv)
     in_dir, out_dir = pio.dirs(args)
     t0 = time.perf_counter()
@@ -325,6 +396,7 @@ def main(argv=None) -> None:
           f"(raw LightGBM output, before isotonic)")
     print(f"  Brier raw {cal['brier_raw']:.5f} -> cross-fitted calibrated {cal['brier_cv']:.5f}")
     print(f"  ECE   raw {cal['ece_raw']:.5f} -> cross-fitted calibrated {cal['ece_cv']:.5f}")
+    print_reliability(cal)
 
     # ── save ─────────────────────────────────────────────────────────────────
     model_out = config.model_path(out_dir)

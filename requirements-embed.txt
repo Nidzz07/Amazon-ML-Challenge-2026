@@ -1,0 +1,5 @@
+# Extra packages for the GPU embedding stage only (src/s2a_embed.py). Install on top of requirements.txt.
+# torch is NOT pinned here: use a CUDA build that matches the GPU (Kaggle images ship one preinstalled).
+# Local development used torch 2.7.0.dev20250310+cu124.
+# faiss is no longer needed: the top-20 search is an exact chunked GPU matmul (see s2a_embed.py).
+sentence-transformers==6.1.0
