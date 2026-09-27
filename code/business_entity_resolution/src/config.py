@@ -157,7 +157,17 @@ MAX_CANDIDATES_PER_ENTITY = 30
 # Absolute on purpose, never a fraction: a key with n Source-1 and m pool records emits
 # n x m pairs, so a ceiling that grew with the shard would let one key emit hundreds of
 # millions. A key over this on EITHER side is dropped. Tunable (sweep --exact-key-max-bucket).
-EXACT_KEY_MAX_BUCKET = 5_000
+# 1,000 (was 5,000, 2026-09-27): a block that large is noise ("house number 100 in TX").
+# Full train, analytically: 1,000 drops ~55% of India / ~50% of US exact_key pairs vs 5,000
+# (218M vs 492M, 134M vs 274M, before cross-family dedup). Smoke recall@30 is 0.9879 at
+# smoke B = 23 and at 113, i.e. full-scale ~1,012 and ~4,972: no measured cost.
+# CAVEAT: that translation assumes bucket sizes scale linearly with shard size (smoke is
+# ~1/44 of full on both sides). Unverified: the first full validation recall report must
+# confirm it. A literal 1,000 changes nothing on smoke (no smoke bucket is that large).
+EXACT_KEY_MAX_BUCKET = 1_000
+# exact_key runs its join / group_by / rank in this many hash buckets of Source-1 entities
+# (bounds memory; output does not depend on it).
+EXACT_KEY_S1_BUCKETS = 16
 
 # Assembly (S6). How the empty prediction (m = 0) is scored in the expected-F0.5
 # prefix search; m >= 1 always uses the plug-in 1.25*c_hat / (0.25*k_hat + m).
@@ -206,8 +216,19 @@ EXACT_KEY_FAMILIES = (
 RARE_TOKEN_DF_MIN = 2
 # Share of the shard's S1 + pool records (see the df ceilings note above TFIDF_MAX_DF).
 RARE_TOKEN_DF_MAX = 0.005
+# ...and never more than this many records, whatever the shard size: the ceiling is
+# min(RARE_TOKEN_DF_MAX x N, RARE_TOKEN_DF_MAX_ABS). The roadmap specified an absolute
+# 5,000; the relative 0.005 alone resolved to 37,552 on the full US shard, where a
+# "rare" token posting to 37k records made the per-chunk join blow past 13 GB. On smoke
+# (566 / 850) it never binds. None = relative ceiling only.
+RARE_TOKEN_DF_MAX_ABS = 5_000
 RARE_TOKENS_PER_ENTITY = 3
-RARE_TOKEN_CHUNK_ROWS = 50_000
+# Source-1 entities per postings join (output does not depend on it; verified 777 vs
+# 50,000 byte-identical on smoke). Bounds the join: 20,000 added ~8 GB on full US.
+RARE_TOKEN_CHUNK_ROWS = 10_000
+# Pool records per token-extraction slice (output does not depend on it). The whole
+# pool's token frame is never built: 7.5M US records' tokens as strings peaked ~10.9 GB.
+RARE_TOKEN_SLICE_ROWS = 500_000
 # Per-entity cap on this channel's own output (ranked by shared rare tokens, then rarity).
 # Uncapped, three tokens at the df ceiling can yield ~15k postings per entity.
 RARE_TOKEN_TOP_K = 100

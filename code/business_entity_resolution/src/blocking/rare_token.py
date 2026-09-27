@@ -12,6 +12,12 @@ channel_score = number of the entity's rare tokens a candidate shares.
 channel_rank orders by that, then by the rarest shared token's df, and only the top
 config.RARE_TOKEN_TOP_K per entity are kept.
 Source-1 rows are processed in chunks so the postings join stays bounded.
+
+The ceiling is min(RARE_TOKEN_DF_MAX x N, RARE_TOKEN_DF_MAX_ABS). Memory: the pool's
+tokens are never materialised as one frame. Token dedup is per record and df counts
+distinct records, so both are computed per slice of config.RARE_TOKEN_SLICE_ROWS pool
+records (pass 1: df, summed; pass 2: postings of in-range tokens only). Same output as
+one pass, given unique pool entity_ids, which run() asserts.
 """
 import polars as pl
 
@@ -37,19 +43,29 @@ def _tokens(df: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def _pool_slices(pool: pl.DataFrame):
+    step = max(1, config.RARE_TOKEN_SLICE_ROWS)
+    for off in range(0, pool.height, step):
+        yield _tokens(pool.slice(off, step))
+
+
 def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFrame:
     df_max = resolve_df("RARE_TOKEN_DF_MAX", config.RARE_TOKEN_DF_MAX, s1.height + pool.height)
+    if config.RARE_TOKEN_DF_MAX_ABS is not None and (df_max is None or df_max > config.RARE_TOKEN_DF_MAX_ABS):
+        print(f"    RARE_TOKEN_DF_MAX_ABS caps it at {config.RARE_TOKEN_DF_MAX_ABS:,}")
+        df_max = config.RARE_TOKEN_DF_MAX_ABS
     in_range = pl.col("df") >= config.RARE_TOKEN_DF_MIN
     if df_max is not None:
         in_range &= pl.col("df") <= df_max
-    s1_tok, pool_tok = _tokens(s1), _tokens(pool)
-    df = (
-        pl.concat([s1_tok.lazy(), pool_tok.lazy()])
-        .group_by("tok")
-        .len(name="df")
-        .filter(in_range)
-        .collect(engine="streaming")
-    )
+    # Per-slice dedup and df counts only add up to the one-pass values if no record id repeats.
+    assert pool["entity_id"].n_unique() == pool.height, "rare_token: duplicate pool entity_id"
+    s1_tok = _tokens(s1)
+    counts = s1_tok.group_by("tok").len(name="df")
+    for t in _pool_slices(pool):  # pass 1: df = distinct records per token, summed over slices
+        counts = pl.concat([counts, t.group_by("tok").len(name="df")]).group_by("tok").agg(pl.col("df").sum())
+        del t
+    df = counts.with_columns(pl.col("df").cast(pl.UInt32)).filter(in_range)
+    del counts
     rarest = (
         s1_tok.join(df, on="tok", how="inner")
         .sort(["entity_id", "df", "tok"])
@@ -57,7 +73,10 @@ def run(s1: pl.DataFrame, pool: pl.DataFrame, smoke: bool = False) -> pl.DataFra
         .head(config.RARE_TOKENS_PER_ENTITY)
         .rename({"entity_id": "source1_entity_id"})
     )
-    postings = pool_tok.join(df.select("tok"), on="tok", how="semi").rename({"entity_id": "candidate_entity_id"})
+    # pass 2: postings of in-range tokens only, slice by slice
+    posts = [t.join(df.select("tok"), on="tok", how="semi") for t in _pool_slices(pool)]
+    postings = (pl.concat(posts) if posts else _tokens(pool)).rename({"entity_id": "candidate_entity_id"})
+    del posts
 
     ids = rarest["source1_entity_id"].unique(maintain_order=True)
     parts = []
