@@ -303,10 +303,20 @@ def featurise_split(
     if verbose:
         print(f"  embed_ann: {f'joined from {embed_path}' if embed_all is not None else f'no file at {embed_path}: embed_cosine = 0, embed_rank = {EMBED_RANK_MISSING:g} (missing)'}")
 
+    # Atomic output: chunks stream into <name>.partial, which is renamed over the real name only
+    # after the last chunk is written and the writer closed. A crash (or a guard kill) can
+    # therefore never leave a valid-looking features file holding only the shards that ran.
+    # The previous run's file goes first, so a failed re-run leaves nothing for s5 to score
+    # rather than a complete-looking file built from an older candidate set.
+    tmp_path = out_path.with_name(out_path.name + ".partial")
+    out_path.unlink(missing_ok=True)
+    tmp_path.unlink(missing_ok=True)
+
     t0 = time.perf_counter()
     rows = positives = 0
     peak = _rss_mb()
     writer = None
+    ok = False
     try:
         for country in shard_countries(split, in_dir):
             ts = time.perf_counter()
@@ -341,7 +351,7 @@ def featurise_split(
                     pio.check_schema(out, schema, out_path.name)
                     table = out.to_arrow()
                     if writer is None:
-                        writer = pq.ParquetWriter(out_path, table.schema)
+                        writer = pq.ParquetWriter(tmp_path, table.schema)
                     writer.write_table(table)
                     shard_rows += out.height
                     if split == "train":
@@ -360,10 +370,15 @@ def featurise_split(
                       + (f"  {shard_pos:>9,} positives" if split == "train" else ""))
 
         if writer is None:  # no shard produced a row: still emit a schema-correct file
-            pl.DataFrame(schema=schema).write_parquet(out_path)
+            pl.DataFrame(schema=schema).write_parquet(tmp_path)
+        ok = True
     finally:
         if writer is not None:
             writer.close()
+        if ok:
+            tmp_path.replace(out_path)  # atomic on one volume: complete, or not there at all
+        else:
+            tmp_path.unlink(missing_ok=True)
 
     return {"rows": rows, "positives": positives, "sec": time.perf_counter() - t0, "peak_rss_mb": peak}
 
