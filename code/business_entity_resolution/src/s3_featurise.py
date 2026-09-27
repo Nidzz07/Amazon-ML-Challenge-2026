@@ -283,7 +283,7 @@ def featurise_chunk(pairs: pl.DataFrame, split: str, fcols: list[str]) -> pl.Dat
 
 def _featurise_country(split: str, in_dir, country, embed_all, labels_all, write, *,
                        chunk_rows: int, block_rows: int, fcols: list[str], schema: dict,
-                       name: str, verbose: bool) -> dict:
+                       name: str, verbose: bool, fraction: float = 1.0) -> dict:
     """Featurise one country shard, handing each finished chunk (a pyarrow Table) to `write`.
 
     Memory: the country's Source-1 and pool norm frames are loaded once (any candidate can be any
@@ -301,9 +301,19 @@ def _featurise_country(split: str, in_dir, country, embed_all, labels_all, write
         if verbose:
             print(f"  [{split}/{country}] 0 candidate pairs, skipped", flush=True)
         return {"rows": 0, "positives": 0, "peak_rss_mb": _rss_mb()}
-    pool_norm = _prefix_cols(_load_pool(split, in_dir, country), "cand")
+    # Candidate-level aggregates over EVERY entity of the country, before any sampling below and
+    # before the pool is loaded (so the two largest transient allocations never overlap).
     cand_comp = _cand_competition(cand_lf)
+    pool_norm = _prefix_cols(_load_pool(split, in_dir, country), "cand")
 
+    n_all = s1_ids.len()
+    if fraction < 1.0:
+        # Train-only entity sample, AFTER the shard-wide aggregates: a sampled entity's features
+        # are exactly what a full run gives it (cand_n_claims etc. still count every entity).
+        # An independent hash (seed=1) so the sample is exact to 0.1% and is not tied to the
+        # processing buckets below; it is a random sample, so the country mix is preserved.
+        keep = (s1_ids.hash(seed=1) % 1000) < round(fraction * 1000)
+        s1_ids = s1_ids.filter(keep)
     n_b = max(1, config.S3_S1_BUCKETS)
     bucket = (s1_ids.hash(seed=0) % n_b).to_numpy()
     rows = positives = 0
@@ -338,8 +348,9 @@ def _featurise_country(split: str, in_dir, country, embed_all, labels_all, write
         sec = time.perf_counter() - ts
         print(f"  [{split}/{country}] {rows:>12,} pairs  {sec:7.1f}s  {rows / max(sec, 1e-9):>9,.0f} rows/s"
               + (f"  {positives:>9,} positives" if split == "train" else "")
+              + (f"  {s1_ids.len():,} of {n_all:,} entities (fraction {fraction:g})" if fraction < 1.0 else "")
               + f"  peak {peak:,.0f} MB", flush=True)
-    return {"rows": rows, "positives": positives, "peak_rss_mb": peak}
+    return {"rows": rows, "positives": positives, "peak_rss_mb": peak, "entities": s1_ids.len()}
 
 
 def _embed_guard(split: str, in_dir, smoke: bool):
@@ -365,7 +376,8 @@ def _embed_guard(split: str, in_dir, smoke: bool):
     return embed_all, embed_path
 
 
-def _country_part(split: str, in_dir, country, part: Path, *, chunk_rows, block_rows, smoke, verbose) -> dict:
+def _country_part(split: str, in_dir, country, part: Path, *, chunk_rows, block_rows, smoke, verbose,
+                  fraction: float = 1.0) -> dict:
     """Child-process entry: one country into `part`. A plain write: the parent owns atomicity."""
     embed_all, _ = _embed_guard(split, in_dir, smoke)
     labels_all = _true_pairs(in_dir).collect() if split == "train" else None
@@ -380,7 +392,7 @@ def _country_part(split: str, in_dir, country, part: Path, *, chunk_rows, block_
     try:
         return _featurise_country(split, in_dir, country, embed_all, labels_all, write,
                                   chunk_rows=chunk_rows, block_rows=block_rows, fcols=fcols,
-                                  schema=schema, name=part.name, verbose=verbose)
+                                  schema=schema, name=part.name, verbose=verbose, fraction=fraction)
     finally:
         if "w" in holder:
             holder["w"].close()
@@ -408,6 +420,7 @@ def featurise_split(
     verbose: bool = True,
     smoke: bool = False,
     isolate: bool | None = None,
+    fraction: float = 1.0,
 ) -> dict:
     """Shard `split` by country, bucket and chunk within country, stream to features_{split}.
 
@@ -418,6 +431,10 @@ def featurise_split(
 
     Returns {rows, positives, sec, peak_rss_mb}.
     """
+    if fraction < 1.0 and split != "train":
+        raise SystemExit(f"s3_featurise: --bucket-fraction samples TRAIN entities only; {split} is always featurised in full.")
+    if not 0.0 < fraction <= 1.0:
+        raise SystemExit(f"s3_featurise: --bucket-fraction must be in (0, 1], got {fraction}")
     chunk_rows = chunk_rows or config.S3_CHUNK_ROWS
     block_rows = max(block_rows or config.S3_JOIN_BLOCK_ROWS, chunk_rows)
     isolate = config.S3_COUNTRY_PROCESSES if isolate is None else isolate
@@ -429,7 +446,8 @@ def featurise_split(
     if verbose:
         print(f"  embed_ann: {f'joined from {embed_path}' if embed_all is not None else f'no file at {embed_path}: embed_cosine = 0, embed_rank = {EMBED_RANK_MISSING:g} (missing)'}")
         print(f"  mode: {'one child process per country' if isolate else 'in-process'}, "
-              f"{config.S3_S1_BUCKETS} Source-1 buckets per country", flush=True)
+              f"{config.S3_S1_BUCKETS} Source-1 buckets per country"
+              + (f", TRAIN SAMPLE: {fraction:g} of entities (aggregates over all)" if fraction < 1.0 else ""), flush=True)
 
     # Atomic output: everything streams into <name>.partial, which is renamed over the real name
     # only after the last row is written and the writer closed. A crash (or a guard kill) can
@@ -455,7 +473,7 @@ def featurise_split(
                 cmd = [sys.executable, str(Path(__file__).resolve()), "--splits", split,
                        "--input", str(in_dir), "--output", str(out_dir),
                        "--chunk-rows", str(chunk_rows), "--block-rows", str(block_rows),
-                       "--_country", str(country), "--_part", str(part)]
+                       "--_country", str(country), "--_part", str(part), "--bucket-fraction", str(fraction)]
                 if smoke:
                     cmd.append("--smoke")
                 rc = subprocess.run(cmd, env=_child_env()).returncode
@@ -482,7 +500,7 @@ def featurise_split(
                 for country in countries:
                     st = _featurise_country(split, in_dir, country, embed_all, labels_all, write,
                                             chunk_rows=chunk_rows, block_rows=block_rows, fcols=fcols,
-                                            schema=schema, name=out_path.name, verbose=verbose)
+                                            schema=schema, name=out_path.name, verbose=verbose, fraction=fraction)
                     rows += st["rows"]
                     positives += st["positives"]
                     peak = max(peak, st["peak_rss_mb"])
@@ -512,6 +530,9 @@ def main(argv=None) -> None:
                     help=f"pairs per norm-join block (default {config.S3_JOIN_BLOCK_ROWS:,})")
     ap.add_argument("--splits", nargs="+", default=list(config.SPLITS),
                     help="only featurise these splits")
+    ap.add_argument("--bucket-fraction", type=float, default=1.0,
+                    help="TRAIN ONLY: featurise this fraction of Source-1 entities (hash sample, taken after "
+                         "the per-candidate aggregates are computed over every entity). Default 1 = all.")
     ap.add_argument("--_country", help=argparse.SUPPRESS)  # child mode: one country ...
     ap.add_argument("--_part", type=Path, help=argparse.SUPPRESS)  # ... into this part file
     args = ap.parse_args(argv)
@@ -519,7 +540,7 @@ def main(argv=None) -> None:
         in_dir, _ = pio.dirs(args)
         st = _country_part(args.splits[0], in_dir, args._country, args._part,
                            chunk_rows=args.chunk_rows, block_rows=args.block_rows,
-                           smoke=args.smoke, verbose=True)
+                           smoke=args.smoke, verbose=True, fraction=args.bucket_fraction)
         args._part.with_suffix(".json").write_text(json.dumps(st), encoding=config.ENCODING)
         return 0
     in_dir, out_dir = pio.dirs(args)
@@ -550,7 +571,8 @@ def main(argv=None) -> None:
             )
 
         print(f"\n[{split}]")
-        st = featurise_split(split, in_dir, out_dir, args.chunk_rows, args.block_rows, smoke=args.smoke)
+        st = featurise_split(split, in_dir, out_dir, args.chunk_rows, args.block_rows, smoke=args.smoke,
+                             fraction=args.bucket_fraction)
         ran.append(split)
         out = config.features_path(split, out_dir)
         pos = f", {st['positives']:,} positives" if split == "train" else ""
