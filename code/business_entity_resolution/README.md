@@ -36,10 +36,26 @@ on Kaggle.
 ```
 data/dataset/train/{train_source1,train_source2,train_source3,train_ground_truth}.tsv
 data/dataset/test/{test_source1,test_source2,test_source3}.tsv
-data/utils/validate_submission.py     # the organisers' validator, unmodified; tests/test_pipeline.py needs it
-artifacts/                            # every intermediate Parquet, gitignored; artifacts/smoke/ for the smoke sample
+data/utils/validate_submission.py     # the organisers' validator, unmodified (also run by the s6 submission gate)
+artifacts/                            # every intermediate Parquet; artifacts/smoke/ for the smoke sample
 output/                               # matching_results.tsv, candidate_pairs.tsv
 ```
+
+All paths are relative to the project root, which `config.py` takes to be three directories above `src/`
+(`src/` -> `business_entity_resolution/` -> `code/` -> root).
+
+**Inside the submission zip** the project root is the zip root. Unpack it, then put the organisers' data next
+to `code/` and `output/`:
+
+```
+<zip root>/
+  code/business_entity_resolution/{src/, README.md, requirements.txt, requirements-embed.txt}
+  data/dataset/{train,test}/...        # the organisers' TSVs (not shipped in the zip)
+  data/utils/validate_submission.py    # the organisers' validator (not shipped in the zip)
+  output/                              # the submitted TSVs; a re-run of s6 overwrites them
+```
+
+`requirements.txt` and `requirements-embed.txt` sit next to this README; install them from here.
 
 ## Running it (full data)
 
@@ -61,7 +77,26 @@ python s6_assemble.py                # -> output/matching_results.tsv, output/ca
 python s7_evaluate.py                # -> artifacts/reports/report_<tag>.json (macro F0.5, by country, by bucket)
 ```
 
-Smoke run (small, minutes; what the tests use): `python make_smoke_sample.py` once, then each stage with `--smoke`.
+Smoke run (small, minutes): `python make_smoke_sample.py` once, then each stage with `--smoke`.
+
+### Splitting S2 blocking across machines
+
+S2 checkpoints every (country, channel) output to `artifacts/s2_parts/<split>/<country>_<channel>.parquet`, and
+`manifest.json` in that folder fingerprints the shared inputs and each channel's own settings. That lets the
+work be split:
+
+1. Every machine runs the **same commit** on the **same** `norm_{split}_source*.parquet` files.
+2. Each machine computes its share, either whole channels with
+   `python s2_block.py --splits train --channels name_tfidf addr_tfidf --resume`, or a single shard with
+   `python compute_channel_shard.py addr_tfidf US --splits train`.
+3. Copy the resulting `<country>_<channel>.parquet` files into one machine's `artifacts/s2_parts/<split>/`.
+   `compute_channel_shard.py` also prints a `"channels"` JSON entry: merge it into that machine's
+   `manifest.json`, or `--resume` treats the copied part as stale and recomputes it.
+4. On that machine run `python s2_block.py --splits <split> --resume`. It reuses every part whose settings
+   match, computes anything missing, and runs the per-country union + cap once all five channels are present.
+
+Never run S2 on a split **without** `--resume` once parts from another machine are in place: that recomputes
+every channel listed (all five by default) and deletes the copied parts.
 
 ## The embedding stage (S2a)
 
@@ -110,13 +145,13 @@ end so the output holds only the embeddings file.
 
 ## Tests
 
-```bash
-python -m pytest tests -q          # needs data/utils/validate_submission.py and artifacts/smoke/smoke_test_source{1,2,3}.tsv
-```
+The test suite lives in the project repository (`tests/`) and is not part of the submission zip. In the
+repository: `python -m pytest tests -q` (needs `data/utils/validate_submission.py` and the smoke sample).
 
 ## Known limitations
 
 - France has no ground truth, so nothing here measures French recall; the transfer test (US <-> India) is only a proxy.
-- Blocking recall figures were measured on India / smoke; see `PROJECT_ROADMAP.md` (decisions log) for the cap analysis.
+- Blocking recall figures were measured on an India sample and on the smoke sample; the candidate-cap analysis is
+  summarised in `Documentation_template.md` (Appendix B).
 - Several legacy scaffold scripts remain in `src/` (`build_training_set.py`, `train.py`, `calibrate.py`, `score.py`,
   `transfer_test.py`); the pipeline stages above replace them and nothing imports them.
