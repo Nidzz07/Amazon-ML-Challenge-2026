@@ -145,6 +145,18 @@ S1_CHUNK_ROWS = 1_000_000
 #                       >= S3_CHUNK_ROWS and is clamped up if it is not.
 S3_CHUNK_ROWS = 10_000
 S3_JOIN_BLOCK_ROWS = 250_000
+# Full-scale memory (measured on the 16 GB box, test split, 50k chunks): featurising is flat
+# at ~5.5 GB per shard, but holding a whole country's candidates + aggregates + embedding rows
+# took India's SETUP alone past 7.5 GB, and one process carried France's memory into India.
+#   S3_S1_BUCKETS         a country's Source-1 entities are featurised in this many hash
+#                         buckets; only one bucket's candidates / embeddings sit in memory.
+#                         Output does not depend on it (entity aggregates are per entity,
+#                         candidate aggregates are computed once over the whole country).
+#   S3_COUNTRY_PROCESSES  run each country in its own child process, so nothing one country
+#                         allocated is still held when the next loads. Parts are streamed into
+#                         features_{split}.parquet at the end, atomically.
+S3_S1_BUCKETS = 8
+S3_COUNTRY_PROCESSES = True
 
 # Blocking.
 # Channel bit positions in candidates.channels (uint8 bitmask).
