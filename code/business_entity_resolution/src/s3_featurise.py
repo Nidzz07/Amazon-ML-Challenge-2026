@@ -171,10 +171,17 @@ def _add_context_and_competition(cands: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-def _load_embed_scores(split: str, in_dir) -> pl.LazyFrame | None:
+def _load_embed_scores(split: str, where) -> pl.LazyFrame | None:
     """Lazy handle on the precomputed embedding scores for `split`; nothing is read until a shard collects
-    it (see _embed_for_shard). The full-scale file has ~79M rows, and reading it whole cost several GB per split."""
-    embed_path = Path(in_dir) / "embed_ann_pairs.parquet"
+    it (see _embed_for_shard). The full-scale file has ~79M rows, and reading it whole cost several GB per split.
+
+    `where` is the embeddings file itself or a directory holding config.EMBED_ANN_FILENAME. featurise_split
+    passes config.embed_ann_path(smoke) — the same resolver the s2 embed_ann channel uses — so the two stages
+    always read the same file. (Resolving it from s3's --input dir instead made s2 and s3 read different
+    places whenever --input was not artifacts/, e.g. the D: layout.)"""
+    embed_path = Path(where)
+    if embed_path.is_dir():
+        embed_path = embed_path / config.EMBED_ANN_FILENAME
     if not embed_path.exists():
         return None
     lf = pl.scan_parquet(embed_path)
@@ -263,6 +270,7 @@ def featurise_split(
     chunk_rows: int = None,
     block_rows: int = None,
     verbose: bool = True,
+    smoke: bool = False,
 ) -> dict:
     """Shard `split` by country, chunk within country, stream to features_{split}.
 
@@ -274,10 +282,26 @@ def featurise_split(
     schema = out_schema(split)
     out_path = config.features_path(split, out_dir)
 
-    embed_all = _load_embed_scores(split, in_dir)
+    embed_path = config.embed_ann_path(smoke)
+    embed_all = _load_embed_scores(split, embed_path)
+    if embed_all is None:
+        # Checked for the whole split before anything is written: a per-shard check would leave a
+        # valid-looking features file holding only the shards that ran before it fired.
+        n_ann = (
+            pl.scan_parquet(config.candidates_path(split, in_dir))
+            .filter((pl.col("channels") & (1 << config.CHANNELS.index("embed_ann"))) > 0)
+            .select(pl.len()).collect(engine="streaming").item()
+        )
+        if n_ann:
+            raise SystemExit(
+                f"s3_featurise: {n_ann:,} {split} candidates came from the embed_ann channel, but there is no "
+                f"embeddings file at {embed_path}. Featurising now would write ch_embed_ann = 1 beside "
+                f"embed_cosine = 0 / embed_rank = {EMBED_RANK_MISSING:g}. Put the file s2 used at that path "
+                f"(config.EMBED_ANN_PATH) and re-run. Nothing was written."
+            )
     labels_all = _true_pairs(in_dir).collect() if split == "train" else None
     if verbose:
-        print(f"  embed_ann: {'joined from embed_ann_pairs.parquet' if embed_all is not None else 'no precomputed scores found, embed_cosine = 0, embed_rank = 9999 (missing)'}")
+        print(f"  embed_ann: {f'joined from {embed_path}' if embed_all is not None else f'no file at {embed_path}: embed_cosine = 0, embed_rank = {EMBED_RANK_MISSING:g} (missing)'}")
 
     t0 = time.perf_counter()
     rows = positives = 0
@@ -381,7 +405,7 @@ def main(argv=None) -> None:
             )
 
         print(f"\n[{split}]")
-        st = featurise_split(split, in_dir, out_dir, args.chunk_rows, args.block_rows)
+        st = featurise_split(split, in_dir, out_dir, args.chunk_rows, args.block_rows, smoke=args.smoke)
         ran.append(split)
         out = config.features_path(split, out_dir)
         pos = f", {st['positives']:,} positives" if split == "train" else ""
