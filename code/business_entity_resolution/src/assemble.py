@@ -26,6 +26,17 @@ def enforce_uniqueness(scored: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def enforce_uniqueness_partitioned(scored: pl.DataFrame, parts: int) -> pl.DataFrame:
+    """enforce_uniqueness over candidate-hash partitions. Every claim on a candidate falls in the
+    same partition, so the kept claims are exactly enforce_uniqueness's; only the multi-key string
+    sort is 1/parts the size (the full-test one-shot sort took s6 past 7.5 GB). Row order differs,
+    which prefix_search does not see: it re-sorts by a total order first."""
+    if parts <= 1:
+        return enforce_uniqueness(scored)
+    part = scored["candidate_entity_id"].hash(seed=0) % parts
+    return pl.concat([enforce_uniqueness(scored.filter(part == i)) for i in range(parts)])
+
+
 def empty_score(q: pl.Expr, k_hat: pl.Expr, mode: str) -> pl.Expr:
     if mode == "p_none":
         # prod(1 - q) computed in log space; q = 1 gives log(0) = -inf and so exp -> 0.

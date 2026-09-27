@@ -37,6 +37,10 @@ Usage:
     python s3_featurise.py [--smoke] [--input DIR] [--output DIR]
     python s3_featurise.py --smoke --chunk-rows 25000 --block-rows 500000
 """
+import argparse
+import json
+import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -100,7 +104,10 @@ def _load_norm(split: str, src: str, in_dir, country: str | None = None) -> pl.D
         have.add("name_suffix")
     if country is not None and "country" in have:
         lf = lf.filter(pl.col("country") == country)
-    return lf.select([c for c in _NORM_COLS if c in have]).collect()
+    # Streaming: the country filter runs batch by batch, so only this country's rows are ever
+    # accumulated. The in-memory engine decoded every row of the file first: loading India's
+    # 4.7M-record pool (1.4 GB of data) peaked at +4.6 GB and pushed s3's India setup past 7.5 GB.
+    return lf.select([c for c in _NORM_COLS if c in have]).collect(engine="streaming")
 
 
 def _load_pool(split: str, in_dir, country: str | None = None) -> pl.DataFrame:
@@ -137,7 +144,19 @@ def _prefix_cols(df: pl.DataFrame, prefix: str) -> pl.DataFrame:
     )
 
 
-def _add_context_and_competition(cands: pl.DataFrame) -> pl.DataFrame:
+def _cand_competition(cands: pl.LazyFrame | pl.DataFrame) -> pl.DataFrame:
+    """Candidate-level competition aggregates (cand_best_score, cand_n_claims). Must be computed
+    over EVERY entity in the country shard, never one bucket: at inference every entity
+    competes, and a per-bucket count would shrink cand_n_claims and inflate cand_is_argmax."""
+    return (
+        cands.lazy().group_by("candidate_entity_id").agg(
+            pl.col("prior_score").max().alias("cand_best_score"),
+            pl.len().cast(pl.Float32).alias("cand_n_claims"),
+        ).collect(engine="streaming")
+    )
+
+
+def _add_context_and_competition(cands: pl.DataFrame, cand_comp: pl.DataFrame | None = None) -> pl.DataFrame:
     """Add context features (entity-level) and competition features
     (candidate-level) as new columns on the candidates DataFrame.
 
@@ -154,11 +173,10 @@ def _add_context_and_competition(cands: pl.DataFrame) -> pl.DataFrame:
         pl.len().cast(pl.Float32).alias("entity_n_cands"),
     )
 
-    # Competition: for each candidate, its best score across all entities
-    cand_comp = cands.group_by("candidate_entity_id").agg(
-        pl.col("prior_score").max().alias("cand_best_score"),
-        pl.len().cast(pl.Float32).alias("cand_n_claims"),
-    )
+    # Competition: for each candidate, its best score across all entities. Callers that only
+    # hold one bucket of a shard pass the shard-wide table in.
+    if cand_comp is None:
+        cand_comp = _cand_competition(cands)
 
     return (
         cands
@@ -263,25 +281,81 @@ def featurise_chunk(pairs: pl.DataFrame, split: str, fcols: list[str]) -> pl.Dat
 # Main
 # ═══════════════════════════════════════════════════════════════════════
 
-def featurise_split(
-    split: str,
-    in_dir,
-    out_dir,
-    chunk_rows: int = None,
-    block_rows: int = None,
-    verbose: bool = True,
-    smoke: bool = False,
-) -> dict:
-    """Shard `split` by country, chunk within country, stream to features_{split}.
+def _featurise_country(split: str, in_dir, country, embed_all, labels_all, write, *,
+                       chunk_rows: int, block_rows: int, fcols: list[str], schema: dict,
+                       name: str, verbose: bool, fraction: float = 1.0) -> dict:
+    """Featurise one country shard, handing each finished chunk (a pyarrow Table) to `write`.
 
-    Returns {rows, positives, sec, peak_rss_mb}.
-    """
-    chunk_rows = chunk_rows or config.S3_CHUNK_ROWS
-    block_rows = max(block_rows or config.S3_JOIN_BLOCK_ROWS, chunk_rows)
-    fcols = pio.feature_columns(NUM_FEATURES)
-    schema = out_schema(split)
-    out_path = config.features_path(split, out_dir)
+    Memory: the country's Source-1 and pool norm frames are loaded once (any candidate can be any
+    pool record). Candidate-level aggregates are computed once over the whole shard with a
+    streaming group_by. Source-1 entities are then walked in config.S3_S1_BUCKETS hash buckets,
+    and only one bucket's candidates, entity aggregates, embedding rows and labels are held at a
+    time. Feature values are exactly as when the whole shard was held: entity aggregates are per
+    entity, and candidate aggregates still cover every entity of the shard."""
+    ts = time.perf_counter()
+    s1_norm = _prefix_cols(_load_norm(split, config.SOURCE1_SRC, in_dir, country), "s1")
+    s1_ids = s1_norm["entity_id"]
+    cand_lf = pl.scan_parquet(config.candidates_path(split, in_dir)).filter(
+        pl.col("source1_entity_id").is_in(s1_ids.implode()))
+    if cand_lf.select(pl.len()).collect(engine="streaming").item() == 0:
+        if verbose:
+            print(f"  [{split}/{country}] 0 candidate pairs, skipped", flush=True)
+        return {"rows": 0, "positives": 0, "peak_rss_mb": _rss_mb()}
+    # Candidate-level aggregates over EVERY entity of the country, before any sampling below and
+    # before the pool is loaded (so the two largest transient allocations never overlap).
+    cand_comp = _cand_competition(cand_lf)
+    pool_norm = _prefix_cols(_load_pool(split, in_dir, country), "cand")
 
+    n_all = s1_ids.len()
+    if fraction < 1.0:
+        # Train-only entity sample, AFTER the shard-wide aggregates: a sampled entity's features
+        # are exactly what a full run gives it (cand_n_claims etc. still count every entity).
+        # An independent hash (seed=1) so the sample is exact to 0.1% and is not tied to the
+        # processing buckets below; it is a random sample, so the country mix is preserved.
+        keep = (s1_ids.hash(seed=1) % 1000) < round(fraction * 1000)
+        s1_ids = s1_ids.filter(keep)
+    n_b = max(1, config.S3_S1_BUCKETS)
+    bucket = (s1_ids.hash(seed=0) % n_b).to_numpy()
+    rows = positives = 0
+    peak = _rss_mb()
+    for b in range(n_b):
+        ids_b = s1_ids.filter(pl.Series(bucket == b))
+        if ids_b.is_empty():
+            continue
+        cands = cand_lf.filter(pl.col("source1_entity_id").is_in(ids_b.implode())).collect(engine="streaming")
+        if cands.is_empty():
+            continue
+        cands = _add_context_and_competition(cands, cand_comp)
+        embed = _embed_for_shard(embed_all, country, ids_b)
+        labels = (
+            labels_all.filter(pl.col("source1_entity_id").is_in(ids_b.implode()))
+            if labels_all is not None else None
+        )
+        for block in cands.iter_slices(block_rows):
+            joined = _join_block(block, s1_norm, pool_norm, embed, labels)
+            for chunk in joined.iter_slices(chunk_rows):
+                out = featurise_chunk(chunk, split, fcols)
+                pio.check_schema(out, schema, name)
+                write(out.to_arrow())
+                rows += out.height
+                if split == "train":
+                    positives += int(out["label"].sum())
+                peak = max(peak, _rss_mb())
+                del out
+            del joined
+        del cands, embed, labels
+    if verbose:
+        sec = time.perf_counter() - ts
+        print(f"  [{split}/{country}] {rows:>12,} pairs  {sec:7.1f}s  {rows / max(sec, 1e-9):>9,.0f} rows/s"
+              + (f"  {positives:>9,} positives" if split == "train" else "")
+              + (f"  {s1_ids.len():,} of {n_all:,} entities (fraction {fraction:g})" if fraction < 1.0 else "")
+              + f"  peak {peak:,.0f} MB", flush=True)
+    return {"rows": rows, "positives": positives, "peak_rss_mb": peak, "entities": s1_ids.len()}
+
+
+def _embed_guard(split: str, in_dir, smoke: bool):
+    """(embeddings LazyFrame or None, its path). Refuses, before anything is written, when the
+    split has embed_ann-channel candidates but there is no embeddings file."""
     embed_path = config.embed_ann_path(smoke)
     embed_all = _load_embed_scores(split, embed_path)
     if embed_all is None:
@@ -299,82 +373,147 @@ def featurise_split(
                 f"embed_cosine = 0 / embed_rank = {EMBED_RANK_MISSING:g}. Put the file s2 used at that path "
                 f"(config.EMBED_ANN_PATH) and re-run. Nothing was written."
             )
+    return embed_all, embed_path
+
+
+def _country_part(split: str, in_dir, country, part: Path, *, chunk_rows, block_rows, smoke, verbose,
+                  fraction: float = 1.0) -> dict:
+    """Child-process entry: one country into `part`. A plain write: the parent owns atomicity."""
+    embed_all, _ = _embed_guard(split, in_dir, smoke)
     labels_all = _true_pairs(in_dir).collect() if split == "train" else None
+    fcols, schema = pio.feature_columns(NUM_FEATURES), out_schema(split)
+    holder = {}
+
+    def write(table):
+        if "w" not in holder:
+            holder["w"] = pq.ParquetWriter(part, table.schema)
+        holder["w"].write_table(table)
+
+    try:
+        return _featurise_country(split, in_dir, country, embed_all, labels_all, write,
+                                  chunk_rows=chunk_rows, block_rows=block_rows, fcols=fcols,
+                                  schema=schema, name=part.name, verbose=verbose, fraction=fraction)
+    finally:
+        if "w" in holder:
+            holder["w"].close()
+
+
+def _child_env() -> dict:
+    """Environment for the per-country child processes. polars on Windows allocates through
+    mimalloc, which by default keeps freed memory reserved instead of returning it to the OS, so a
+    process's RSS tracks its high-water mark. Measured on test India's setup (16 GB box): loading a
+    4.7M-record pool that is 1.4 GB of data held 4.9 GB by default and 2.8 GB with purge delay 0;
+    the whole setup peaked 5.0 GB instead of passing 7.2 GB. The values are only defaults: anything
+    already set in the environment wins. mimalloc reads them at process start, hence children."""
+    env = {**os.environ, "PYTHONUTF8": "1"}
+    env.setdefault("MIMALLOC_PURGE_DELAY", "0")   # mimalloc v2
+    env.setdefault("MIMALLOC_RESET_DELAY", "0")   # the same knob's older name
+    return env
+
+
+def featurise_split(
+    split: str,
+    in_dir,
+    out_dir,
+    chunk_rows: int = None,
+    block_rows: int = None,
+    verbose: bool = True,
+    smoke: bool = False,
+    isolate: bool | None = None,
+    fraction: float = 1.0,
+) -> dict:
+    """Shard `split` by country, bucket and chunk within country, stream to features_{split}.
+
+    With isolate (default config.S3_COUNTRY_PROCESSES) each country runs in its own child
+    process and writes a part, and the parts are then streamed into the output, so nothing one
+    country allocated is still held when the next one loads (in one process, France's retained
+    memory plus India's load passed 7.5 GB on the 16 GB box).
+
+    Returns {rows, positives, sec, peak_rss_mb}.
+    """
+    if fraction < 1.0 and split != "train":
+        raise SystemExit(f"s3_featurise: --bucket-fraction samples TRAIN entities only; {split} is always featurised in full.")
+    if not 0.0 < fraction <= 1.0:
+        raise SystemExit(f"s3_featurise: --bucket-fraction must be in (0, 1], got {fraction}")
+    chunk_rows = chunk_rows or config.S3_CHUNK_ROWS
+    block_rows = max(block_rows or config.S3_JOIN_BLOCK_ROWS, chunk_rows)
+    isolate = config.S3_COUNTRY_PROCESSES if isolate is None else isolate
+    fcols = pio.feature_columns(NUM_FEATURES)
+    schema = out_schema(split)
+    out_path = config.features_path(split, out_dir)
+
+    embed_all, embed_path = _embed_guard(split, in_dir, smoke)
     if verbose:
         print(f"  embed_ann: {f'joined from {embed_path}' if embed_all is not None else f'no file at {embed_path}: embed_cosine = 0, embed_rank = {EMBED_RANK_MISSING:g} (missing)'}")
+        print(f"  mode: {'one child process per country' if isolate else 'in-process'}, "
+              f"{config.S3_S1_BUCKETS} Source-1 buckets per country"
+              + (f", TRAIN SAMPLE: {fraction:g} of entities (aggregates over all)" if fraction < 1.0 else ""), flush=True)
 
-    # Atomic output: chunks stream into <name>.partial, which is renamed over the real name only
-    # after the last chunk is written and the writer closed. A crash (or a guard kill) can
-    # therefore never leave a valid-looking features file holding only the shards that ran.
-    # The previous run's file goes first, so a failed re-run leaves nothing for s5 to score
-    # rather than a complete-looking file built from an older candidate set.
+    # Atomic output: everything streams into <name>.partial, which is renamed over the real name
+    # only after the last row is written and the writer closed. A crash (or a guard kill) can
+    # never leave a valid-looking features file holding only the shards that ran. The previous
+    # run's file goes first, so a failed re-run leaves nothing for s5 to score rather than a
+    # complete-looking file built from an older candidate set.
     tmp_path = out_path.with_name(out_path.name + ".partial")
     out_path.unlink(missing_ok=True)
     tmp_path.unlink(missing_ok=True)
+    countries = shard_countries(split, in_dir)
+    parts = [out_path.with_name(f"{out_path.name}.{c}.part") for c in countries]
+    for pth in parts:
+        pth.unlink(missing_ok=True)
+        pth.with_suffix(".json").unlink(missing_ok=True)
 
     t0 = time.perf_counter()
     rows = positives = 0
     peak = _rss_mb()
-    writer = None
     ok = False
     try:
-        for country in shard_countries(split, in_dir):
-            ts = time.perf_counter()
-            s1_norm = _prefix_cols(_load_norm(split, config.SOURCE1_SRC, in_dir, country), "s1")
-            pool_norm = _prefix_cols(_load_pool(split, in_dir, country), "cand")
-            s1_ids = s1_norm["entity_id"]
+        if isolate:
+            for country, part in zip(countries, parts):
+                cmd = [sys.executable, str(Path(__file__).resolve()), "--splits", split,
+                       "--input", str(in_dir), "--output", str(out_dir),
+                       "--chunk-rows", str(chunk_rows), "--block-rows", str(block_rows),
+                       "--_country", str(country), "--_part", str(part), "--bucket-fraction", str(fraction)]
+                if smoke:
+                    cmd.append("--smoke")
+                rc = subprocess.run(cmd, env=_child_env()).returncode
+                if rc != 0:
+                    raise SystemExit(f"s3_featurise: the {split}/{country} child process failed (exit {rc}). "
+                                     f"Nothing was written.")
+                st = json.loads(part.with_suffix(".json").read_text(encoding=config.ENCODING))
+                rows += st["rows"]
+                positives += st["positives"]
+                peak = max(peak, st["peak_rss_mb"])
+            written = [p for p in parts if p.exists()]
+            if written:
+                pl.scan_parquet(written).sink_parquet(tmp_path)
+        else:
+            holder = {}
 
-            cands = (
-                pl.scan_parquet(config.candidates_path(split, in_dir))
-                .filter(pl.col("source1_entity_id").is_in(s1_ids.implode()))
-                .collect(engine="streaming")
-            )
-            if cands.is_empty():
-                if verbose:
-                    print(f"  [{split}/{country}] 0 candidate pairs — skipped")
-                continue
-            cands = _add_context_and_competition(cands)
+            def write(table):
+                if "w" not in holder:
+                    holder["w"] = pq.ParquetWriter(tmp_path, table.schema)
+                holder["w"].write_table(table)
 
-            # Restrict the two pair-keyed side tables to this shard, so the
-            # per-block joins never probe the other countries' rows.
-            embed = _embed_for_shard(embed_all, country, s1_ids)
-            labels = (
-                labels_all.filter(pl.col("source1_entity_id").is_in(s1_ids.implode()))
-                if labels_all is not None else None
-            )
-
-            shard_rows = shard_pos = 0
-            for block in cands.iter_slices(block_rows):
-                joined = _join_block(block, s1_norm, pool_norm, embed, labels)
-                for chunk in joined.iter_slices(chunk_rows):
-                    out = featurise_chunk(chunk, split, fcols)
-                    pio.check_schema(out, schema, out_path.name)
-                    table = out.to_arrow()
-                    if writer is None:
-                        writer = pq.ParquetWriter(tmp_path, table.schema)
-                    writer.write_table(table)
-                    shard_rows += out.height
-                    if split == "train":
-                        shard_pos += int(out["label"].sum())
-                    peak = max(peak, _rss_mb())
-                    del out, table
-                del joined
-            del cands, s1_norm, pool_norm, embed, labels
-
-            rows += shard_rows
-            positives += shard_pos
-            if verbose:
-                sec = time.perf_counter() - ts
-                print(f"  [{split}/{country}] {shard_rows:>12,} pairs  {sec:7.1f}s  "
-                      f"{shard_rows / max(sec, 1e-9):>9,.0f} rows/s"
-                      + (f"  {shard_pos:>9,} positives" if split == "train" else ""))
-
-        if writer is None:  # no shard produced a row: still emit a schema-correct file
+            labels_all = _true_pairs(in_dir).collect() if split == "train" else None
+            try:
+                for country in countries:
+                    st = _featurise_country(split, in_dir, country, embed_all, labels_all, write,
+                                            chunk_rows=chunk_rows, block_rows=block_rows, fcols=fcols,
+                                            schema=schema, name=out_path.name, verbose=verbose, fraction=fraction)
+                    rows += st["rows"]
+                    positives += st["positives"]
+                    peak = max(peak, st["peak_rss_mb"])
+            finally:
+                if "w" in holder:
+                    holder["w"].close()
+        if not tmp_path.exists():  # no shard produced a row: still emit a schema-correct file
             pl.DataFrame(schema=schema).write_parquet(tmp_path)
         ok = True
     finally:
-        if writer is not None:
-            writer.close()
+        for pth in parts:
+            pth.unlink(missing_ok=True)
+            pth.with_suffix(".json").unlink(missing_ok=True)
         if ok:
             tmp_path.replace(out_path)  # atomic on one volume: complete, or not there at all
         else:
@@ -391,7 +530,19 @@ def main(argv=None) -> None:
                     help=f"pairs per norm-join block (default {config.S3_JOIN_BLOCK_ROWS:,})")
     ap.add_argument("--splits", nargs="+", default=list(config.SPLITS),
                     help="only featurise these splits")
+    ap.add_argument("--bucket-fraction", type=float, default=1.0,
+                    help="TRAIN ONLY: featurise this fraction of Source-1 entities (hash sample, taken after "
+                         "the per-candidate aggregates are computed over every entity). Default 1 = all.")
+    ap.add_argument("--_country", help=argparse.SUPPRESS)  # child mode: one country ...
+    ap.add_argument("--_part", type=Path, help=argparse.SUPPRESS)  # ... into this part file
     args = ap.parse_args(argv)
+    if args._country is not None:
+        in_dir, _ = pio.dirs(args)
+        st = _country_part(args.splits[0], in_dir, args._country, args._part,
+                           chunk_rows=args.chunk_rows, block_rows=args.block_rows,
+                           smoke=args.smoke, verbose=True, fraction=args.bucket_fraction)
+        args._part.with_suffix(".json").write_text(json.dumps(st), encoding=config.ENCODING)
+        return 0
     in_dir, out_dir = pio.dirs(args)
     t0 = time.perf_counter()
 
@@ -420,7 +571,8 @@ def main(argv=None) -> None:
             )
 
         print(f"\n[{split}]")
-        st = featurise_split(split, in_dir, out_dir, args.chunk_rows, args.block_rows, smoke=args.smoke)
+        st = featurise_split(split, in_dir, out_dir, args.chunk_rows, args.block_rows, smoke=args.smoke,
+                             fraction=args.bucket_fraction)
         ran.append(split)
         out = config.features_path(split, out_dir)
         pos = f", {st['positives']:,} positives" if split == "train" else ""
