@@ -109,6 +109,24 @@ def main(argv=None) -> None:
     if held_out is not None:
         entities = entities.filter(pl.col("source1_entity_id").is_in(held_out.implode()))
 
+    # Evaluate only entities that were actually scored. With a sampled train featurisation
+    # (s3 --bucket-fraction) most held-out entities have no features, so s6 writes them an empty
+    # row; counting those as "predicted no match" would make the score meaningless. Every entity
+    # in candidates_{split} has candidates, so "scored" is exactly "featurised" here.
+    scored_file = config.scored_path(SPLIT, in_dir)
+    if not scored_file.exists():
+        raise SystemExit(f"{scored_file} not found: run s5 (for held-out entities: s5_score.py "
+                         f"--splits {SPLIT} --val-only) before s7")
+    scored_ids = (pl.scan_parquet(scored_file).select(pl.col("source1_entity_id").unique())
+                  .collect(engine="streaming"))
+    n_pool = entities.height
+    entities = entities.join(scored_ids, on="source1_entity_id", how="semi")
+    pool_name = "held-out" if held_out is not None else "train"
+    print(f"evaluated {entities.height:,} of {n_pool:,} {pool_name} entities "
+          f"({entities.height / max(n_pool, 1):.0%} sample: only entities present in {scored_file.name})")
+    if entities.height == 0:
+        raise SystemExit(f"no {pool_name} entity appears in {scored_file.name}: nothing to evaluate")
+
     # Load predictions and check coverage
     pred_file = config.matching_results_path(SPLIT, in_dir)
     pred_ids = pl.read_csv(
@@ -128,6 +146,8 @@ def main(argv=None) -> None:
         "tag": args.tag or (("smoke_" if args.smoke else "") + pio.git_sha()),
         "split": "smoke_train" if args.smoke else ("val" if held_out is not None else "train"),
         "metric_impl": "metric.py",
+        "evaluated_entities": entities.height,
+        "entity_pool": n_pool,
         "feature_version": None,
         "overall": summarise(scored),
         "by_country": {
@@ -162,6 +182,10 @@ def main(argv=None) -> None:
     )
     for country, cs in report["by_country"].items():
         print(f"  {country}: F0.5 {cs['macro_f05']:.4f}, P {cs['precision'] or 0:.4f}, R {cs['recall']:.4f}")
+    if held_out is not None:
+        print("  WARNING: this is an UPPER BOUND on test F0.5. Validation has no France (15% of test, no "
+              "training data), and in s6's one-claim-per-candidate step the held-out entities only "
+              "compete with each other, not with the rest of train.")
     print(f"wrote {out}")
     print(f"s7 done in {time.perf_counter() - t0:.1f}s")
 

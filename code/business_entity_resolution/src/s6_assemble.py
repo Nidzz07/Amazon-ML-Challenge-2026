@@ -14,7 +14,12 @@ names the validator expects; other splits go to the artifacts dir with a _{split
 suffix. --output overrides both.
 
 Usage:
-    python s6_assemble.py [--smoke] [--input DIR] [--output DIR]
+    python s6_assemble.py [--smoke] [--input DIR] [--output DIR] [--splits train test]
+    python s6_assemble.py --splits test     # the submission only (e.g. a laptop with no train files)
+
+--splits defaults to every split, as before. Every split you ask for must have its
+records, candidates and scored files: a missing one is an error before anything is
+written (non-zero exit), never a silent skip that could hide a crashed s5.
 """
 import sys
 import time
@@ -27,11 +32,33 @@ import pipeline_io as pio
 import validate_submission_native
 
 
-def main(argv=None) -> None:
-    args = pio.parser(__doc__).parse_args(argv)
+def main(argv=None) -> int:
+    ap = pio.parser(__doc__)
+    ap.add_argument("--splits", nargs="+", choices=list(config.SPLITS), default=list(config.SPLITS),
+                    help="splits to assemble (default: all). A requested split with a missing input is an "
+                         "error, never a skip.")
+    args = ap.parse_args(argv)
     in_dir, out_dir = pio.dirs(args)
+
+    # Pre-flight for EVERY requested split before anything is written, so a missing scored file
+    # (e.g. a crashed s5) can never end in exit 0 with no submission, or in a half-written run.
+    missing = [
+        (split, p) for split in args.splits
+        for p in (config.records_path(split, config.SOURCE1_SRC, in_dir),
+                  config.candidates_path(split, in_dir),
+                  config.scored_path(split, in_dir))
+        if not p.exists()
+    ]
+    if missing:
+        lines = "\n".join(f"    {split:<6}{p}" for split, p in missing)
+        raise SystemExit(
+            f"s6_assemble: requested split(s) {', '.join(sorted({s for s, _ in missing}))} are missing inputs:\n"
+            f"{lines}\n  Run the stage that produces them (s0 records / s2 candidates / s5 scored), or drop the "
+            f"split from --splits. Nothing was written."
+        )
+
     t0 = time.perf_counter()
-    for split in config.SPLITS:
+    for split in args.splits:
         dest = args.output or (
             (config.SMOKE_OUTPUT_DIR if args.smoke else config.OUTPUT_DIR) if split == "test" else out_dir
         )
@@ -63,6 +90,7 @@ def main(argv=None) -> None:
         print(f"  m>0: {m_pos.height:,} ({100 * m_pos.height / n:.2f}%), mean m {m_pos['m'].mean() or 0:.2f}, "
               f"{matches.height:,} matches -> {match_path.parent}")
     print(f"s6 done in {time.perf_counter() - t0:.1f}s")
+    return 0
 
 
 if __name__ == "__main__":
