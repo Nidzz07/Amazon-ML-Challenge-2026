@@ -160,20 +160,55 @@ def peak_rss_bytes() -> int | None:
     return peak if sys.platform == "darwin" else peak * 1024  # Linux reports KiB, macOS bytes
 
 
+# Rows of `pairs` per list-building slice, and Source-1 entities per written block.
+# Neither changes the output; together they bound write_id_lists' working set.
+ID_LIST_PAIR_ROWS = 2_000_000
+ID_LIST_WRITE_ROWS = 100_000
+
+
 def write_id_lists(s1_ids: pl.Series, pairs: pl.DataFrame, list_col: str, path: Path) -> None:
     """One row per Source-1 entity, in s1_ids order; ids in `pairs` order, comma-joined;
-    empty string (never null/NaN) when an entity has none. Tab-separated, UTF-8, no quoting."""
-    lists = pairs.group_by("source1_entity_id", maintain_order=True).agg(
-        pl.col("candidate_entity_id").str.join(",").alias(list_col)
-    )
-    out = (
-        pl.DataFrame({"source1_entity_id": s1_ids})
-        .join(lists, on="source1_entity_id", how="left", maintain_order="left")
-        .with_columns(pl.col(list_col).fill_null(""))
-    )
-    assert out.height == len(s1_ids) and out["source1_entity_id"].n_unique() == out.height
+    empty string (never null/NaN) when an entity has none. Tab-separated, UTF-8, no quoting.
+
+    Bounded memory, same bytes as the one-shot version (one group_by + str.join over every
+    pair, then one write_csv), which peaked at ~7 GB on the full test candidates (52M IDs):
+      - lists are built over row slices of `pairs` cut at entity boundaries. That needs each
+        entity's rows contiguous; if they are not, a stable sort by entity makes them so and
+        keeps every entity's ID order;
+      - the output is written in blocks of s1_ids through one file handle, header once."""
+    assert s1_ids.n_unique() == len(s1_ids), "write_id_lists: duplicate Source-1 ids"
+    p = pairs.select("source1_entity_id", "candidate_entity_id")
+    # Contiguous iff no entity starts two runs; checked on the ~1.7M run values, not by
+    # hashing all ~52M rows.
+    runs = p["source1_entity_id"].rle().struct.field("value")
+    if runs.n_unique() != runs.len():  # an entity's rows are split
+        p = p.sort("source1_entity_id", maintain_order=True)
+    del runs
+    run = p["source1_entity_id"].rle_id()
+    lists, start = [], 0
+    while start < p.height:
+        end = min(start + ID_LIST_PAIR_ROWS, p.height)
+        if end < p.height:  # extend to the end of the entity straddling the cut
+            last = run[end - 1]
+            end = start + int(run.slice(start).search_sorted(last + 1))
+        lists.append(
+            p.slice(start, end - start).group_by("source1_entity_id", maintain_order=True)
+            .agg(pl.col("candidate_entity_id").str.join(",").alias(list_col))
+        )
+        start = end
+    del p, run
+    lists = pl.concat(lists) if lists else pl.DataFrame(schema={"source1_entity_id": pl.String, list_col: pl.String})
+    ids = pl.DataFrame({"source1_entity_id": s1_ids})
     path.parent.mkdir(parents=True, exist_ok=True)
-    out.write_csv(path, separator=config.TSV_SEP, quote_style="never", line_terminator="\n")
+    with open(path, "wb") as fh:
+        for i, off in enumerate(range(0, max(ids.height, 1), ID_LIST_WRITE_ROWS)):
+            block = (
+                ids.slice(off, ID_LIST_WRITE_ROWS)
+                .join(lists, on="source1_entity_id", how="left", maintain_order="left")
+                .with_columns(pl.col(list_col).fill_null(""))
+            )
+            block.write_csv(fh, separator=config.TSV_SEP, quote_style="never", line_terminator="\n",
+                            include_header=i == 0)
 
 
 def read_id_lists(path: Path, list_col: str) -> pl.DataFrame:
