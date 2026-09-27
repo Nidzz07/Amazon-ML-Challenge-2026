@@ -8,8 +8,13 @@ Two layers, both must pass:
      [ours]    stricter than the scorer; a break means a pipeline bug, not a rejection
 2. OUTER GATE: the organisers' own student_resource/utils/validate_submission.py
    (config.VALIDATOR), run unmodified in a subprocess against a test dir whose files
-   carry the names it hard-codes (test_source1/2/3.tsv). Optional: if the script is
-   absent the gate says so loudly and relies on layer 1.
+   carry the names it hard-codes (test_source1/2/3.tsv). It checks matching_results.tsv
+   only by default: given the ~52M-ID candidate file it passes 7.5 GB (its own docstring
+   says to drop --candidate then), and layer 1 checks that file. --organiser-candidate
+   adds it back. Optional: if the script is absent the gate says so loudly.
+
+Measured at full size (1,732,544 rows, 51,975,919 candidate IDs): layer 1 47.5 s, peak
+3.7 GB; layer 2 11.4 s, peak 1.4 GB.
 
 Rules, applied to matching_results.tsv and (same rules, own header) candidate_pairs.tsv:
   file     [scorer] exists, non-empty, strict UTF-8
@@ -192,29 +197,39 @@ def _format_pass(path: Path, kind: str) -> int:
     return rows
 
 
-def _long(path: Path, kind: str) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """(one row per line: line, s1), (one row per listed ID: line, s1, id).
-    Only called after _format_pass, so plain splitting is safe."""
+def _ids_lazy(path: Path, kind: str) -> tuple[pl.LazyFrame, pl.LazyFrame]:
+    """(one row per line: line, s1), (one row per listed ID: line, s1, id), both LAZY.
+    Only called after _format_pass, so plain splitting is safe. Nothing here materialises
+    the exploded ID list: a full-size candidate_pairs.tsv is ~52M IDs, and holding it whole
+    (plus the anti-join against it) took this gate past 7.5 GB."""
     col = HEADERS[kind][1]
-    df = (
-        pl.read_csv(path, separator="\t", quote_char=None, infer_schema=False, encoding="utf8")
+    lf = (
+        pl.scan_csv(path, separator="	", quote_char=None, infer_schema=False, encoding="utf8")
         .with_row_index("line", offset=2)
-        .with_columns(pl.col(col).fill_null(""))
     )
-    long = (
-        df.select("line", KEY, pl.col(col).str.split(",").alias("id"))
+    rows = lf.select("line", KEY)
+    ids = (
+        lf.select("line", KEY, pl.col(col).fill_null("").str.split(",").alias("id"))
         .explode("id", empty_as_null=False)
         .filter(pl.col("id").is_not_null() & (pl.col("id") != ""))
     )
-    return df.select("line", KEY), long
+    return rows, ids
 
 
-def _first(df: pl.DataFrame) -> dict | None:
-    return df.sort("line").row(0, named=True) if df.height else None
+def _first(lf: pl.LazyFrame) -> dict | None:
+    """The lowest-line row of `lf`, found with a streaming min() so that even a file where every
+    row offends never has to be materialised."""
+    first = lf.select(pl.col("line").min()).collect(engine="streaming").item()
+    if first is None:
+        return None
+    return lf.filter(pl.col("line") == first).collect(engine="streaming").row(0, named=True)
 
 
 def native_check(matching: Path, candidate: Path | None, files: dict[str, Path]) -> dict:
-    """Layer 1. Raises SubmissionRejected on the first violation, else returns counts."""
+    """Layer 1. Raises SubmissionRejected on the first violation, else returns counts.
+    Memory stays bounded at full size: the per-ID checks stream over the exploded lists, and the
+    matching-subset-of-candidates check probes the candidate stream against the (small) matched
+    pairs instead of holding every candidate ID."""
     for s, p in files.items():
         if not p.is_file():
             raise SubmissionRejected("ours", "cannot verify", p, None,
@@ -229,34 +244,43 @@ def native_check(matching: Path, candidate: Path | None, files: dict[str, Path])
         if path is None:
             continue
         report[f"{kind}_rows"] = _format_pass(path, kind)
-        parsed[kind] = _long(path, kind)
+        parsed[kind] = _ids_lazy(path, kind)
 
     for kind, path in (("matching", matching), ("candidate", candidate)):
         if kind not in parsed:
             continue
-        rows, long = parsed[kind]
-        bad = _first(rows.filter(~pl.col(KEY).is_in(test_s1.implode())))
+        rows_lf, ids_lf = parsed[kind]
+        rows = rows_lf.collect()  # one row per entity: 1.73M at full size, cheap
+        bad = _first(rows.lazy().filter(~pl.col(KEY).is_in(test_s1.implode())))
         if bad:
             raise SubmissionRejected("scorer", "query ID not in test set", path, bad["line"],
                                      f"{bad[KEY]} is not in {files['source1'].name}")
-        bad = _first(long.filter(~pl.col("id").is_in(pool.implode())))
+        bad = _first(ids_lf.filter(~pl.col("id").is_in(pool.implode())))
         if bad:
             raise SubmissionRejected("ours", "ID not in test pool", path, bad["line"],
                                      f"{bad[KEY]}: {bad['id']} is in neither {files['source2'].name} nor "
                                      f"{files['source3'].name} (the scorer would just score it 0)")
         if kind == "matching" and "candidate" in parsed:
-            bad = _first(long.join(parsed["candidate"][1].select(KEY, "id"), on=[KEY, "id"], how="anti"))
+            matched = ids_lf.collect(engine="streaming")  # ~5.7M pairs at full size
+            found = (
+                parsed["candidate"][1].select(KEY, "id")
+                .join(matched.lazy().select(KEY, "id"), on=[KEY, "id"], how="semi")
+                .collect(engine="streaming")
+            )
+            bad = _first(matched.lazy().join(found.lazy(), on=[KEY, "id"], how="anti"))
             if bad:
                 raise SubmissionRejected("ours", "match not in candidate list", path, bad["line"],
                                          f"{bad[KEY]}: {bad['id']} is not in its candidate_pairs.tsv row")
+            del matched, found
         missing = pl.DataFrame({KEY: test_s1}).join(rows.select(KEY), on=KEY, how="anti")
         if missing.height:
             raise SubmissionRejected("scorer", "missing entity (completeness)", path, None,
                                      f"{missing.height:,} of {test_s1.len():,} test entities have no row, "
                                      f"first: {missing[KEY][0]}",
                                      "every test_source1 entity needs a row; write '' for no match")
-        report[f"{kind}_ids"] = long.height
-        report[f"{kind}_empty_rows"] = rows.height - long.select(KEY).n_unique()
+        n_ids, n_with = ids_lf.select(pl.len(), pl.col(KEY).n_unique()).collect(engine="streaming").row(0)
+        report[f"{kind}_ids"] = n_ids
+        report[f"{kind}_empty_rows"] = rows.height - n_with
     return report
 
 
@@ -264,19 +288,30 @@ def native_check(matching: Path, candidate: Path | None, files: dict[str, Path])
 
 def organiser_check(matching: Path, candidate: Path | None, files: dict[str, Path],
                     check_ids: bool = False, script: Path = config.VALIDATOR) -> tuple[bool | None, str]:
-    """(passed, output). passed is None when the script does not exist."""
+    """(passed, output). passed is None when the script does not exist.
+
+    `candidate=None` must really mean "no candidate check": the organisers' script otherwise falls
+    back to output/candidate_pairs.tsv relative to the working directory, which on submission night
+    is the real ~660 MB file, and with it the script passes 7.5 GB. So it is handed an explicit path
+    that does not exist, which it skips with a warning."""
     if not Path(script).is_file():
         return None, f"organisers' validator not found at {script}"
-    with tempfile.TemporaryDirectory(prefix="val_testdir_") as tmp:
+    names_ok = all(p.name == f"test_{s}.tsv" for s, p in files.items())
+    one_dir = len({p.parent for p in files.values()}) == 1
+    with tempfile.TemporaryDirectory(prefix="val_testdir_", dir=files["source1"].parent) as tmp:
         d = Path(tmp)
-        for s, p in files.items():  # the script hard-codes these names
-            try:
-                os.link(p, d / f"test_{s}.tsv")
-            except OSError:
-                shutil.copy(p, d / f"test_{s}.tsv")
-        cmd = [sys.executable, str(script), "--matching", str(matching), "--test-dir", str(d)]
-        if candidate is not None:
-            cmd += ["--candidate", str(candidate)]
+        if names_ok and one_dir:
+            test_dir = files["source1"].parent  # already the names it hard-codes: no copy at all
+        else:
+            test_dir = d  # same volume as the inputs, so these are hardlinks, not 1 GB of copies
+            for s, p in files.items():
+                try:
+                    os.link(p, d / f"test_{s}.tsv")
+                except OSError:
+                    shutil.copy(p, d / f"test_{s}.tsv")
+        cand = candidate if candidate is not None else d / "no_candidate_check.tsv"
+        cmd = [sys.executable, str(script), "--matching", str(matching), "--test-dir", str(test_dir),
+               "--candidate", str(cand)]
         if check_ids:
             cmd.append("--check-ids")
         env = {**os.environ, "PYTHONUTF8": "1"}
@@ -287,7 +322,7 @@ def organiser_check(matching: Path, candidate: Path | None, files: dict[str, Pat
 # ── the gate ─────────────────────────────────────────────────────────────────
 
 def gate(matching, candidate=None, *, smoke: bool, test_dir=None, organiser: bool = True,
-         organiser_check_ids: bool = False, quarantine: bool = False) -> dict:
+         organiser_check_ids: bool = False, organiser_candidate: bool = False, quarantine: bool = False) -> dict:
     """Both layers. On failure prints the reason and raises SystemExit(1); with
     quarantine=True the submission files are first renamed to *.REJECTED so a failed
     file can never be uploaded by mistake."""
@@ -315,7 +350,11 @@ def gate(matching, candidate=None, *, smoke: bool, test_dir=None, organiser: boo
     print(f"  native     PASS  {report}")
 
     if organiser:
-        ok, out = organiser_check(matching, candidate, files, organiser_check_ids)
+        # The organisers' script holds every candidate ID in Python sets when given --candidate:
+        # at full size (~52M IDs) it passed 7.5 GB. Its own docstring says to drop --candidate
+        # then ("the matching file is the only one scored"); layer 1 above already checks
+        # candidate_pairs.tsv with the same or stricter rules.
+        ok, out = organiser_check(matching, candidate if organiser_candidate else None, files, organiser_check_ids)
         if ok is None:
             print(f"  organisers SKIPPED — {out}. Native checks only; do NOT treat as final for upload.")
         elif not ok:
@@ -334,6 +373,8 @@ def main(argv=None) -> int:
     ap.add_argument("--no-candidate", action="store_true", help="check matching_results.tsv alone")
     ap.add_argument("--test-dir", type=Path, help="dir with test_source1/2/3.tsv (organisers' names)")
     ap.add_argument("--no-organiser", action="store_true", help="skip the organisers' validator")
+    ap.add_argument("--organiser-candidate", action="store_true",
+                    help="also give candidate_pairs.tsv to the organisers' script (needs >7.5 GB at full size)")
     ap.add_argument("--organiser-check-ids", action="store_true",
                     help="also pass --check-ids to it (several GB at full scale; ours already checks IDs)")
     args = ap.parse_args(argv)
@@ -343,7 +384,8 @@ def main(argv=None) -> int:
     if candidate is not None and not Path(candidate).exists() and args.candidate is None:
         candidate = None
     gate(matching, candidate, smoke=args.smoke, test_dir=args.test_dir,
-         organiser=not args.no_organiser, organiser_check_ids=args.organiser_check_ids)
+         organiser=not args.no_organiser, organiser_check_ids=args.organiser_check_ids,
+         organiser_candidate=args.organiser_candidate)
     return 0
 
 
