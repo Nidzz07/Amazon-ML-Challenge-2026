@@ -21,6 +21,20 @@ from metric import macro_f05_arrays
 SPLIT = "train"
 
 
+def read_id_lists_for(path, list_col: str, entities: pl.DataFrame) -> pl.DataFrame:
+    """pio.read_id_lists restricted to `entities`, filtered before the split/explode and streamed.
+    per_entity only counts pairs of the evaluated entities, so the result is the same; reading
+    every row of the full-train candidate_pairs_train.tsv (66M IDs) crashed s7 on allocation."""
+    return (
+        pl.scan_csv(path, separator=config.TSV_SEP, infer_schema=False, quote_char=None, encoding="utf8")
+        .join(entities.lazy().select("source1_entity_id"), on="source1_entity_id", how="semi")
+        .select("source1_entity_id", pl.col(list_col).fill_null("").str.split(",").alias("candidate_entity_id"))
+        .explode("candidate_entity_id", empty_as_null=False)
+        .filter(pl.col("candidate_entity_id") != "")
+        .collect(engine="streaming")
+    )
+
+
 def per_entity(
     truth: pl.DataFrame,
     pred: pl.DataFrame,
@@ -137,8 +151,8 @@ def main(argv=None) -> None:
     if missing:
         raise SystemExit(f"{pred_file.name} is missing {missing:,} evaluated entities")
 
-    pred = pio.read_id_lists(pred_file, "matched_entity_ids")
-    cand = pio.read_id_lists(config.candidate_pairs_path(SPLIT, in_dir), "candidate_entity_ids")
+    pred = read_id_lists_for(pred_file, "matched_entity_ids", entities)
+    cand = read_id_lists_for(config.candidate_pairs_path(SPLIT, in_dir), "candidate_entity_ids", entities)
 
     # Score
     scored = per_entity(truth, pred, cand, entities)
